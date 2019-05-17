@@ -39,7 +39,7 @@ def generate_content():
     dialects_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'dialects')
 
     v10_dialects = glob.glob(os.path.join(mdef_path, 'v1.0', '*.xml'))
-
+    print(mdef_path)
     # for now v2.0 uses same XML files as v1.0
     v20_dialects = glob.glob(os.path.join(mdef_path, 'v1.0', '*.xml'))
 
