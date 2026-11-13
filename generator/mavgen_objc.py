@@ -1,12 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 parse a MAVLink protocol XML file and generate an Objective-C implementation
 
 Copyright John Boiles 2013
 Released under GNU GPL version 3 or later
 '''
-from __future__ import print_function
-
 import os
 from . import mavparse, mavtemplate
 
@@ -14,14 +12,14 @@ t = mavtemplate.MAVTemplate()
 
 def generate_mavlink(directory, xml):
     '''generate MVMavlink header and implementation'''
-    f = open(os.path.join(directory, "MVMavlink.h"), mode='w')
+    f = open(os.path.join(directory, "MVMavlink.h"), mode='w', encoding='utf-8')
     t.write(f,'''
 //
 //  MVMavlink.h
 //  MAVLink communications protocol built from ${basename}.xml
 //
 //  Created on ${parse_time} by mavgen_objc.py
-//  http://qgroundcontrol.org/mavlink
+//  https://mavlink.io/en/
 //
 
 #import "MVMessage.h"
@@ -47,7 +45,7 @@ ${{message_definition_files:#import "MV${name_camel_case}Messages.h"
  @param mavlink The MVMavlink object calling this method
  @param data NSData object containing the bytes to be sent
  */
-- (BOOL)mavlink:(MVMavlink *)mavlink shouldWriteData:(NSData *)data;
+- (MAV_BOOL)mavlink:(MVMavlink *)mavlink shouldWriteData:(NSData *)data;
 
 @end
 
@@ -72,19 +70,19 @@ ${{message_definition_files:#import "MV${name_camel_case}Messages.h"
  @param message Object conforming to the MVMessage protocol that represents the data to be sent
  @return YES if message sending was successful
  */
-- (BOOL)sendMessage:(id<MVMessage>)message;
+- (MAV_BOOL)sendMessage:(id<MVMessage>)message;
 
 @end
 ''', xml)
     f.close()
-    f = open(os.path.join(directory, "MVMavlink.m"), mode='w')
+    f = open(os.path.join(directory, "MVMavlink.m"), mode='w', encoding='utf-8')
     t.write(f,'''
 //
 //  MVMavlink.m
 //  MAVLink communications protocol built from ${basename}.xml
 //
 //  Created by mavgen_objc.py
-//  http://qgroundcontrol.org/mavlink
+//  https://mavlink.io/en/
 //
 
 #import "MVMavlink.h"
@@ -100,12 +98,14 @@ ${{message_definition_files:#import "MV${name_camel_case}Messages.h"
     if (mavlink_parse_char(MAVLINK_COMM_0, bytes[i], &msg, &status)) {
       // Packet received
       id<MVMessage> message = [MVMessage messageWithCMessage:msg];
-      [_delegate mavlink:self didGetMessage:message];
+      if (message != nil) {
+        [_delegate mavlink:self didGetMessage:message];
+      }
     }
   }
 }
 
-- (BOOL)sendMessage:(id<MVMessage>)message {
+- (MAV_BOOL)sendMessage:(id<MVMessage>)message {
   return [_delegate mavlink:self shouldWriteData:[message data]];
 }
 
@@ -115,14 +115,14 @@ ${{message_definition_files:#import "MV${name_camel_case}Messages.h"
 
 def generate_base_message(directory, xml):
     '''Generate base MVMessage header and implementation'''
-    f = open(os.path.join(directory, 'MVMessage.h'), mode='w')
+    f = open(os.path.join(directory, 'MVMessage.h'), mode='w', encoding='utf-8')
     t.write(f, '''
 //
 //  MVMessage.h
 //  MAVLink communications protocol built from ${basename}.xml
 //
 //  Created by mavgen_objc.py
-//  http://qgroundcontrol.org/mavlink
+//  https://mavlink.io/en/
 //
 
 #import "mavlink.h"
@@ -146,25 +146,25 @@ def generate_base_message(directory, xml):
 + (id<MVMessage>)messageWithCMessage:(mavlink_message_t)message;
 
 //! System ID of the sender of the message.
-- (uint8_t)systemId;
+- (uint32_t)systemId;
 
 //! Component ID of the sender of the message.
 - (uint8_t)componentId;
 
 //! Message ID of this message.
-- (uint8_t)messageId;
+- (uint32_t)messageId;
 
 @end
 ''', xml)
     f.close()
-    f = open(os.path.join(directory, 'MVMessage.m'), mode='w')
+    f = open(os.path.join(directory, 'MVMessage.m'), mode='w', encoding='utf-8')
     t.write(f, '''
 //
 //  MVMessage.m
 //  MAVLink communications protocol built from ${basename}.xml
 //
 //  Created by mavgen_objc.py
-//  http://qgroundcontrol.org/mavlink
+//  https://mavlink.io/en/
 //
 
 #import "MVMessage.h"
@@ -194,6 +194,11 @@ ${{message:      @${id} : [MVMessage${name_camel_case} class],
 }
 
 - (id)initWithCMessage:(mavlink_message_t)message {
+#ifdef MAVLINK_IFLAG_SYSID32
+  if (message.magic == MAVLINK_STX && (message.incompat_flags & ~(MAVLINK_IFLAG_SIGNED | MAVLINK_IFLAG_SYSID32 | MAVLINK_IFLAG_TARGET32))) {
+    return nil;
+  }
+#endif
   if ((self = [super init])) {
     self->_message = message;
   }
@@ -208,7 +213,7 @@ ${{message:      @${id} : [MVMessage${name_camel_case} class],
   return [NSData dataWithBytes:buffer length:length];
 }
 
-- (uint8_t)systemId {
+- (uint32_t)systemId {
   return self->_message.sysid;
 }
 
@@ -216,12 +221,12 @@ ${{message:      @${id} : [MVMessage${name_camel_case} class],
   return self->_message.compid;
 }
 
-- (uint8_t)messageId {
+- (uint32_t)messageId {
   return self->_message.msgid;
 }
 
 - (NSString *)description {
-  return [NSString stringWithFormat:@"%@, systemId=%d, componentId=%d", [self class], self.systemId, self.componentId];
+  return [NSString stringWithFormat:@"%@, systemId=%u, componentId=%d", [self class], self.systemId, self.componentId];
 }
 
 @end
@@ -230,14 +235,14 @@ ${{message:      @${id} : [MVMessage${name_camel_case} class],
 
 def generate_message_definitions_h(directory, xml):
     '''generate headerfile containing includes for all messages'''
-    f = open(os.path.join(directory, "MV" + camel_case_from_underscores(xml.basename) + "Messages.h"), mode='w')
+    f = open(os.path.join(directory, "MV" + camel_case_from_underscores(xml.basename) + "Messages.h"), mode='w', encoding='utf-8')
     t.write(f, '''
 //
 //  MV${basename_camel_case}Messages.h
 //  MAVLink communications protocol built from ${basename}.xml
 //
 //  Created by mavgen_objc.py
-//  http://qgroundcontrol.org/mavlink
+//  https://mavlink.io/en/
 //
 
 ${{message:#import "MVMessage${name_camel_case}.h"
@@ -247,14 +252,15 @@ ${{message:#import "MVMessage${name_camel_case}.h"
 
 def generate_message(directory, m):
     '''generate per-message header and implementation file'''
-    f = open(os.path.join(directory, 'MVMessage%s.h' % m.name_camel_case), mode='w')
+    m.legacy_target_check = ''.join(' || %s > 255' % f.name_lower_camel_case for f in m.fields if f.is_target_system)
+    f = open(os.path.join(directory, 'MVMessage%s.h' % m.name_camel_case), mode='w', encoding='utf-8')
     t.write(f, '''
 //
 //  MVMessage${name_camel_case}.h
 //  MAVLink communications protocol built from ${basename}.xml
 //
 //  Created by mavgen_objc.py
-//  http://qgroundcontrol.org/mavlink
+//  https://mavlink.io/en/
 //
 
 #import "MVMessage.h"
@@ -266,7 +272,7 @@ def generate_message(directory, m):
  */
 @interface MVMessage${name_camel_case} : MVMessage
 
-- (id)initWithSystemId:(uint8_t)systemId componentId:(uint8_t)componentId${{arg_fields: ${name_lower_camel_case}:(${arg_type}${array_prefix})${name_lower_camel_case}}};
+- (id)initWithSystemId:(uint32_t)systemId componentId:(uint8_t)componentId${{arg_fields: ${name_lower_camel_case}:(${arg_type}${array_prefix})${name_lower_camel_case}}};
 
 ${{fields://! ${description}
 - (${return_type})${name_lower_camel_case}${get_arg_objc};
@@ -275,23 +281,28 @@ ${{fields://! ${description}
 @end
 ''', m)
     f.close()
-    f = open(os.path.join(directory, 'MVMessage%s.m' % m.name_camel_case), mode='w')
+    f = open(os.path.join(directory, 'MVMessage%s.m' % m.name_camel_case), mode='w', encoding='utf-8')
     t.write(f, '''
 //
 //  MVMessage${name_camel_case}.m
 //  MAVLink communications protocol built from ${basename}.xml
 //
 //  Created by mavgen_objc.py
-//  http://qgroundcontrol.org/mavlink
+//  https://mavlink.io/en/
 //
 
 #import "MVMessage${name_camel_case}.h"
 
 @implementation MVMessage${name_camel_case}
 
-- (id)initWithSystemId:(uint8_t)systemId componentId:(uint8_t)componentId${{arg_fields: ${name_lower_camel_case}:(${arg_type}${array_prefix})${name_lower_camel_case}}} {
+- (id)initWithSystemId:(uint32_t)systemId componentId:(uint8_t)componentId${{arg_fields: ${name_lower_camel_case}:(${arg_type}${array_prefix})${name_lower_camel_case}}} {
+  #ifndef MAVLINK_IFLAG_SYSID32
+  if (systemId > 255${legacy_target_check}) { return NULL; }
+  #endif
   if ((self = [super init])) {
-    mavlink_msg_${name_lower}_pack(systemId, componentId, &(self->_message)${{arg_fields:, ${name_lower_camel_case}}});
+    if (mavlink_msg_${name_lower}_pack(systemId, componentId, &(self->_message)${{arg_fields:, ${name_lower_camel_case}}}) == 0) {
+      return NULL;
+    }
   }
   return self;
 }
@@ -371,7 +382,11 @@ def generate_message_definitions(basename, xml):
         m.parse_time = xml.parse_time
         m.name_camel_case = camel_case_from_underscores(m.name_lower)
         for f in m.fields:
+            f.description = " ".join(f.description.split())
             f.name_lower_camel_case = lower_camel_case_from_underscores(f.name);
+            # NSObject's description method is also generated below.
+            if f.name_lower_camel_case == 'description':
+                f.name_lower_camel_case = 'payloadDescription'
             f.get_message = "[self %s]" % f.name_lower_camel_case
             f.return_method_implementation = ''
             f.array_prefix = ''
@@ -413,6 +428,17 @@ def generate_message_definitions(basename, xml):
 """char string[%(array_length)d];
   mavlink_msg_%(message_name_lower)s_get_%(name)s(&(self->_message), (char *)&string);
   return [[NSString alloc] initWithBytes:string length:%(array_length)d encoding:NSASCIIStringEncoding];""" % {'array_length': f.array_length, 'message_name_lower': m.name_lower, 'name': f.name}
+
+            if f.is_target_system:
+                f.return_type = f.arg_type = 'uint32_t'
+                f.print_format = '%u'
+                f.return_method_implementation = (
+                    '#ifdef MAVLINK_IFLAG_TARGET32\n'
+                    '  return mavlink_msg_get_target_sysid(&self->_message, '
+                    'mavlink_get_msg_entry(self->_message.msgid));\n'
+                    '#else\n'
+                    '  return self->_message.len > %u ? _MAV_RETURN_uint8_t(&self->_message, %u) : 0;\n'
+                    '#endif' % (f.wire_offset, f.wire_offset))
 
             if not f.return_method_implementation:
                 f.return_method_implementation = \

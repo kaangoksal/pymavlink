@@ -1,9 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''
 check bandwidth of link
 '''
-from __future__ import print_function
 import time
 
 from pymavlink import mavutil
@@ -38,7 +37,7 @@ while True:
     master.mav.vfr_hud_send(1, 2, 3, 4, 5, 6)
 
     #Check for incoming data on the serial port and count
-    #how many mesages of each type have been received
+    #how many messages of each type have been received
     while master.port.inWaiting() > 0:
         #recv_msg will try parsing the serial port buffer
         #and return a new message if available

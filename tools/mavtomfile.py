@@ -1,13 +1,12 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''
 convert a MAVLink tlog file to a MATLab mfile
 '''
-from __future__ import print_function
-from builtins import range
 
 import os
 import re
+import sys
 from pymavlink import mavutil
 
 def process_tlog(filename):
@@ -62,6 +61,7 @@ def process_tlog(filename):
             f.write("%s.columns = {'timestamp'" % mtype)
             for field in fieldnames:
                 val = getattr(m, field)
+
                 if not isinstance(val, str):
                     if type(val) is not list:
                         f.write(",'%s'" % field)
@@ -74,6 +74,7 @@ def process_tlog(filename):
         f.write("%s.data(%u,:) = [%f" % (mtype, type_counters[mtype], m._timestamp))
         for field in m._fieldnames:
             val = getattr(m, field)
+
             if not isinstance(val, str):
                 if type(val) is not list:
                     f.write(",%.20g" % val)

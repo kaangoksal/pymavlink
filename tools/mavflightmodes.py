@@ -1,10 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''
 show changes in flight modes
 '''
-from __future__ import print_function
-
 import datetime
 import os
 import time
@@ -52,7 +50,7 @@ def flight_modes(logfile):
             time_in_mode[previous_mode] = time_in_mode[previous_mode] + (m._timestamp - mode_start_timestamp)
 
             #figure out how many seconds per percentage point so I can
-            #caculate how many seconds for the final mode
+            #calculate how many seconds for the final mode
             if (seconds_per_percent == -1 and previous_percent != -1
                     and previous_percent != mlog.percent):
                 seconds_per_percent = (m._timestamp - mode_start_timestamp) / (mlog.percent - previous_percent)

@@ -1,11 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 Generate a message using different MAVLink versions, put in a buffer and then read from it.
 """
-
-from __future__ import print_function
-from builtins import object
 
 from pymavlink.dialects.v10 import ardupilotmega as mavlink1
 from pymavlink.dialects.v20 import ardupilotmega as mavlink2
@@ -28,17 +25,17 @@ def test_protocol(mavlink, signing=False):
     mav = mavlink.MAVLink(f)
 
     if signing:
-        mav.signing.secret_key = chr(42)*32
+        mav.signing.secret_key = bytearray(chr(42)*32, 'utf-8' )
         mav.signing.link_id = 0
         mav.signing.timestamp = 0
         mav.signing.sign_outgoing = True
 
     # set the WP_RADIUS parameter on the MAV at the end of the link
-    mav.param_set_send(7, 1, "WP_RADIUS", 101, mavlink.MAV_PARAM_TYPE_REAL32)
+    mav.param_set_send(7, 1, b"WP_RADIUS", 101, mavlink.MAV_PARAM_TYPE_REAL32)
 
     # alternatively, produce a MAVLink_param_set object 
     # this can be sent via your own transport if you like
-    m = mav.param_set_encode(7, 1, "WP_RADIUS", 101, mavlink.MAV_PARAM_TYPE_REAL32)
+    m = mav.param_set_encode(7, 1, b"WP_RADIUS", 101, mavlink.MAV_PARAM_TYPE_REAL32)
 
     m.pack(mav)
 

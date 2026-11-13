@@ -1,11 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 
 """
 Unit tests for the quaternion library
 """
 
-from __future__ import absolute_import, division, print_function
 import unittest
 import numpy as np
 from pymavlink.quaternion import QuaternionBase, Quaternion
@@ -65,7 +64,7 @@ class QuaternionBaseTest(unittest.TestCase):
         Helper function for constructor test
 
         Calls constructor for the quaternion from q euler and dcm and checks
-        if the resulting converions are equivalent to the arguments.
+        if the resulting conversions are equivalent to the arguments.
         The test for the euler angles is weak as the solution is not unique
 
         :param q: quaternion 4x1, [w, x, y, z]
@@ -239,7 +238,7 @@ class QuaternionTest(QuaternionBaseTest):
         Helper function for constructor test
 
         Calls constructor for the quaternion from q euler and dcm and checks
-        if the resulting converions are equivalent to the arguments.
+        if the resulting conversions are equivalent to the arguments.
         The test for the euler angles is weak as the solution is not unique
 
         :param q: quaternion 4x1, [w, x, y, z]

@@ -1,10 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''
 test mavlink messages
 '''
-from __future__ import print_function
-
 from pymavlink import mavtest, mavutil
 
 from argparse import ArgumentParser
@@ -21,7 +19,7 @@ def wait_heartbeat(m):
     '''wait for a heartbeat so we know the target system IDs'''
     print("Waiting for APM heartbeat")
     msg = m.recv_match(type='HEARTBEAT', blocking=True)
-    print("Heartbeat from APM (system %u component %u)" % (m.target_system, m.target_system))
+    print("Heartbeat from APM (system %u component %u)" % (m.target_system, m.target_component))
 
 # create a mavlink serial instance
 master = mavutil.mavlink_connection(args.device, baud=args.baudrate, source_system=args.SOURCE_SYSTEM)

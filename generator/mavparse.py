@@ -1,22 +1,19 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 mavlink python parse functions
 
 Copyright Andrew Tridgell 2011
 Released under GNU GPL version 3 or later
 '''
-from __future__ import print_function
-from builtins import range
-from builtins import object
 
 import errno
 import operator
 import os
+import re
 import sys
 import time
 import xml.parsers.expat
 
-PROTOCOL_0_9 = "0.9"
 PROTOCOL_1_0 = "1.0"
 PROTOCOL_2_0 = "2.0"
 
@@ -33,7 +30,7 @@ class MAVParseError(Exception):
         return self.message
 
 class MAVField(object):
-    def __init__(self, name, type, print_format, xml, description='', enum='', display='', units=''):
+    def __init__(self, name, type, print_format, xml, description='', enum='', display='', units='', multiplier='', instance=False, invalid=''):
         self.name = name
         self.name_upper = name.upper()
         self.description = description
@@ -41,9 +38,12 @@ class MAVField(object):
         self.enum = enum
         self.display = display
         self.units = units
+        self.multiplier = multiplier
         self.omit_arg = False
         self.const_value = None
         self.print_format = print_format
+        self.instance = instance
+        self.invalid = invalid
         lengths = {
         'float'    : 4,
         'double'   : 8,
@@ -121,16 +121,32 @@ class MAVField(object):
             self.test_value = v[:-1]
 
 
+class MAVDeprecated(object):
+    def __init__(self, since, replaced_by, explanation=''):
+        self.since = since
+        self.replaced_by = replaced_by
+        self.explanation = explanation
+
+class MAVSuperseded(object):
+    def __init__(self, since, replaced_by, explanation=''):
+        self.since = since
+        self.replaced_by = replaced_by
+        self.explanation = explanation
+
 class MAVType(object):
-    def __init__(self, name, id, linenumber, description=''):
+    def __init__(self, name, id, linenumber, description='', wip=False):
         self.name = name
         self.name_lower = name.lower()
         self.linenumber = linenumber
         self.id = int(id)
+        self.deprecated = None
+        self.superseded = None
         self.description = description
+        self.wip = wip
         self.fields = []
         self.fieldnames = []
         self.extensions_start = None
+        self.needs_pack = False
 
     def base_fields(self):
         '''return number of non-extended fields'''
@@ -139,7 +155,7 @@ class MAVType(object):
         return len(self.fields[:self.extensions_start])
 
 class MAVEnumParam(object):
-    def __init__(self, index, description='', label='', units='', enum='', increment='', minValue='', maxValue='', reserved=False, default=''):
+    def __init__(self, index, description='', label='', units='', enum='', increment='', minValue='', maxValue='', reserved=False, default='', multiplier=''):
         self.index = index
         self.description = description
         self.label = label
@@ -150,39 +166,61 @@ class MAVEnumParam(object):
         self.maxValue = maxValue
         self.reserved = reserved
         self.default = default
-        if self.reserved and not self.default:
-            self.default = '0'
-        self.set_description(description)
+        self.multiplier = multiplier
 
-    def set_description(self, description):
-        if not description.strip() and self.reserved:
-            self.description = 'Reserved (default:%s)' % self.default
+    def set_reserved(self):
+        '''Mark as reserved, replacing any description and default from the XML.
+        param5/param6 double as int32 lat/lon when sent via COMMAND_INT or
+        MISSION_ITEM_INT, which can't carry NaN, so their default depends on the
+        message they are carried in.'''
+        self.reserved = True
+        self.default = 'NaN'
+        if int(self.index) in (5, 6):
+            self.description = 'Reserved. Default: INT32_MAX (COMMAND_INT/MISSION_ITEM_INT) or NaN (COMMAND_LONG).'
         else:
-            self.description = description
+            self.description = 'Reserved. Default: NaN.'
+        self.description += ' Note: Implementations that currently accept 0 as the sentinel values are planning to migrate (check their documentation on the state).'
+
+# Param text that marks a MAV_CMD param as reserved/unused (e.g. "Empty.", "Reserved (set to 0)")
+RESERVED_PARAM_TEXT = re.compile(r'\s*(reserved|empty|unused|not used|n/a|spare)(?=$|[\s.,:;(])', re.IGNORECASE)
 
 class MAVEnumEntry(object):
-    def __init__(self, name, value, description='', end_marker=False, autovalue=False, origin_file='', origin_line=0):
+    def __init__(self, name, value, description='', wip=False, end_marker=False, autovalue=False, origin_file='', origin_line=0, has_location=False, is_destination=False):
         self.name = name
         self.value = value
+        self.deprecated = None
+        self.superseded = None
         self.description = description
+        self.wip = wip
         self.param = []
         self.end_marker = end_marker
         self.autovalue = autovalue  # True if value was *not* specified in XML
         self.origin_file = origin_file
         self.origin_line = origin_line
+        self.has_location = has_location
+        self.is_destination = is_destination
+        # wip/deprecated/superseded of the enum declaration this entry
+        # came from, which may differ from the merged enum's
+        self.enum_wip = False
+        self.enum_deprecated = None
+        self.enum_superseded = None
 
 class MAVEnum(object):
-    def __init__(self, name, linenumber, description=''):
+    def __init__(self, name, linenumber, description='', bitmask=False):
         self.name = name
+        self.deprecated = None
+        self.superseded = None
+        self.wip = False
         self.description = description
         self.entry = []
         self.start_value = None
         self.highest_value = 0
         self.linenumber = linenumber
+        self.bitmask = bitmask
 
 class MAVXML(object):
     '''parse a mavlink XML file'''
-    def __init__(self, filename, wire_protocol_version=PROTOCOL_0_9):
+    def __init__(self, filename, wire_protocol_version=PROTOCOL_1_0):
         self.filename = filename
         self.basename = os.path.basename(filename)
         if self.basename.lower().endswith(".xml"):
@@ -197,34 +235,28 @@ class MAVXML(object):
         self.include = []
         self.wire_protocol_version = wire_protocol_version
 
+        # every protocol we still support is little-endian, sorts its base
+        # fields by descending type length and uses CRC_EXTRA.  These are kept
+        # as attributes for the benefit of out-of-tree generators; only 0.9
+        # ever set them False.
+        self.little_endian = True
+        self.sort_fields = True
+        self.crc_extra = True
+
         # setup the protocol features for the requested protocol version
-        if wire_protocol_version == PROTOCOL_0_9:
-            self.protocol_marker = ord('U')
-            self.sort_fields = False
-            self.little_endian = False
-            self.crc_extra = False
-            self.crc_struct = False
-            self.command_24bit = False
-            self.allow_extensions = False
-        elif wire_protocol_version == PROTOCOL_1_0:
+        if wire_protocol_version == PROTOCOL_1_0:
             self.protocol_marker = 0xFE
-            self.sort_fields = True
-            self.little_endian = True
-            self.crc_extra = True
             self.crc_struct = False
             self.command_24bit = False
             self.allow_extensions = False
         elif wire_protocol_version == PROTOCOL_2_0:
             self.protocol_marker = 0xFD
-            self.sort_fields = True
-            self.little_endian = True
-            self.crc_extra = True
             self.crc_struct = True
             self.command_24bit = True
             self.allow_extensions = True
         else:
             print("Unknown wire protocol version")
-            print("Available versions are: %s %s" % (PROTOCOL_0_9, PROTOCOL_1_0, PROTOCOL_2_0))
+            print("Available versions are: %s %s" % (PROTOCOL_1_0, PROTOCOL_2_0))
             raise MAVParseError('Unknown MAVLink wire protocol version %s' % wire_protocol_version)
 
         in_element_list = []
@@ -235,6 +267,18 @@ class MAVXML(object):
                     raise MAVParseError('expected missing %s "%s" attribute at %s:%u' % (
                         where, c, filename, p.CurrentLineNumber))
 
+        def bool_attr(attrs, name):
+            '''return an optional boolean attribute; absent means False'''
+            value = attrs.get(name, False)
+            if value == 'true':
+                value = True
+            elif value == 'false':
+                value = False
+            if type(value) != bool:
+                raise MAVParseError('invalid %s value "%s" at %s:%u' % (
+                    name, value, filename, p.CurrentLineNumber))
+            return value
+
         def start_element(name, attrs):
             in_element_list.append(name)
             in_element = '.'.join(in_element_list)
@@ -242,8 +286,16 @@ class MAVXML(object):
             if in_element == "mavlink.messages.message":
                 check_attrs(attrs, ['name', 'id'], 'message')
                 self.message.append(MAVType(attrs['name'], attrs['id'], p.CurrentLineNumber))
+            elif in_element == "mavlink.messages.message.wip":
+                self.message[-1].wip = True
             elif in_element == "mavlink.messages.message.extensions":
                 self.message[-1].extensions_start = len(self.message[-1].fields)
+            elif in_element == "mavlink.messages.message.deprecated":
+                check_attrs(attrs, ['since', 'replaced_by'], 'deprecated')
+                self.message[-1].deprecated = MAVDeprecated(attrs['since'], attrs['replaced_by'])
+            elif in_element == "mavlink.messages.message.superseded":
+                check_attrs(attrs, ['since', 'replaced_by'], 'superseded')
+                self.message[-1].superseded = MAVSuperseded(attrs['since'], attrs['replaced_by'])
             elif in_element == "mavlink.messages.message.field":
                 check_attrs(attrs, ['name', 'type'], 'field')
                 print_format = attrs.get('print_format', None)
@@ -252,12 +304,24 @@ class MAVXML(object):
                 units = attrs.get('units', '')
                 if units:
                     units = '[' + units + ']'
-                new_field = MAVField(attrs['name'], attrs['type'], print_format, self, enum=enum, display=display, units=units)
+                invalid = attrs.get('invalid', '')
+                multiplier = attrs.get('multiplier', '')
+                instance = attrs.get('instance', False)
+                new_field = MAVField(attrs['name'], attrs['type'], print_format, self, enum=enum, display=display, units=units, multiplier=multiplier, instance=instance, invalid=invalid)
                 if self.message[-1].extensions_start is None or self.allow_extensions:
                     self.message[-1].fields.append(new_field)
             elif in_element == "mavlink.enums.enum":
                 check_attrs(attrs, ['name'], 'enum')
-                self.enum.append(MAVEnum(attrs['name'], p.CurrentLineNumber))
+                bitmask = 'bitmask' in attrs and attrs['bitmask'] == 'true'
+                self.enum.append(MAVEnum(attrs['name'], p.CurrentLineNumber, bitmask=bitmask))
+            elif in_element == "mavlink.enums.enum.wip":
+                self.enum[-1].wip = True
+            elif in_element == "mavlink.enums.enum.deprecated":
+                check_attrs(attrs, ['since', 'replaced_by'], 'deprecated')
+                self.enum[-1].deprecated = MAVDeprecated(attrs['since'], attrs['replaced_by'])
+            elif in_element == "mavlink.enums.enum.superseded":
+                check_attrs(attrs, ['since', 'replaced_by'], 'superseded')
+                self.enum[-1].superseded = MAVSuperseded(attrs['since'], attrs['replaced_by'])
             elif in_element == "mavlink.enums.enum.entry":
                 check_attrs(attrs, ['name'], 'enum entry')
                 # determine value and if it was automatically assigned (for possible merging later)
@@ -273,8 +337,25 @@ class MAVXML(object):
                 # check highest value
                 if (value > self.enum[-1].highest_value):
                     self.enum[-1].highest_value = value
+                has_location = bool_attr(attrs, 'hasLocation')
+                is_destination = bool_attr(attrs, 'isDestination')
+                if is_destination and not has_location:
+                    # a destination is somewhere the vehicle goes to, so
+                    # it should have a location; older definitions mark
+                    # some entries this way, so warn rather than fail
+                    print('%s is isDestination but not hasLocation at %s:%u' % (
+                        attrs['name'], filename, p.CurrentLineNumber))
+
+                # check bitmask value
+                if self.enum[-1].bitmask:
+                    # values should always be a power of 2
+                    if value.bit_count() != 1:
+                        print(f"{attrs['name']} has invalid values (bitmask must have powers of 2)")
+
                 # append the new entry
-                self.enum[-1].entry.append(MAVEnumEntry(attrs['name'], value, '', False, autovalue, self.filename, p.CurrentLineNumber))
+                self.enum[-1].entry.append(MAVEnumEntry(attrs['name'], value, '', False, False, autovalue, self.filename, p.CurrentLineNumber, has_location=has_location, is_destination=is_destination))
+            elif in_element == "mavlink.enums.enum.entry.wip":
+                self.enum[-1].entry[-1].wip = True
             elif in_element == "mavlink.enums.enum.entry.param":
                 check_attrs(attrs, ['index'], 'enum param')
                 self.enum[-1].entry[-1].param.append(
@@ -282,8 +363,16 @@ class MAVXML(object):
                                                         label=attrs.get('label', ''), units=attrs.get('units', ''), 
                                                         enum=attrs.get('enum', ''), increment=attrs.get('increment', ''), 
                                                         minValue=attrs.get('minValue', ''), 
-                                                        maxValue=attrs.get('maxValue', ''), default=attrs.get('default', '0'), 
-                                                        reserved=attrs.get('reserved', False) ))
+                                                        maxValue=attrs.get('maxValue', ''), default=attrs.get('default', ''), 
+                                                        reserved=attrs.get('reserved', 'false').lower() in ('true', '1'), multiplier=attrs.get('multiplier','')))
+            elif in_element == "mavlink.enums.enum.entry.deprecated":
+                check_attrs(attrs, ['since', 'replaced_by'], 'deprecated')
+                self.enum[-1].entry[-1].deprecated = MAVDeprecated(attrs['since'], attrs['replaced_by'])
+            elif in_element == "mavlink.enums.enum.entry.superseded":
+                check_attrs(attrs, ['since', 'replaced_by'], 'superseded')
+                self.enum[-1].entry[-1].superseded = MAVSuperseded(attrs['since'], attrs['replaced_by'])
+            elif in_element == "mavlink.include":
+                self.include.append('')
 
         def is_target_system_field(m, f):
             if f.name == 'target_system':
@@ -299,19 +388,31 @@ class MAVXML(object):
             in_element = '.'.join(in_element_list)
             if in_element == "mavlink.messages.message.description":
                 self.message[-1].description += data
+            elif in_element == "mavlink.messages.message.deprecated":
+                self.message[-1].deprecated.explanation += data
+            elif in_element == "mavlink.messages.message.superseded":
+                self.message[-1].superseded.explanation += data
             elif in_element == "mavlink.messages.message.field":
                 if self.message[-1].extensions_start is None or self.allow_extensions:
                     self.message[-1].fields[-1].description += data
             elif in_element == "mavlink.enums.enum.description":
                 self.enum[-1].description += data
+            elif in_element == "mavlink.enums.enum.deprecated":
+                self.enum[-1].deprecated.explanation += data
+            elif in_element == "mavlink.enums.enum.superseded":
+                self.enum[-1].superseded.explanation += data
             elif in_element == "mavlink.enums.enum.entry.description":
                 self.enum[-1].entry[-1].description += data
+            elif in_element == "mavlink.enums.enum.entry.deprecated":
+                self.enum[-1].entry[-1].deprecated.explanation += data
+            elif in_element == "mavlink.enums.enum.entry.superseded":
+                self.enum[-1].entry[-1].superseded.explanation += data
             elif in_element == "mavlink.enums.enum.entry.param":
-                self.enum[-1].entry[-1].param[-1].set_description(data.strip())
+                self.enum[-1].entry[-1].param[-1].description += data
             elif in_element == "mavlink.version":
                 self.version = int(data)
             elif in_element == "mavlink.include":
-                self.include.append(data)
+                self.include[-1] += data
 
         f = open(filename, mode='rb')
         p = xml.parsers.expat.ParserCreate()
@@ -320,24 +421,33 @@ class MAVXML(object):
         p.CharacterDataHandler = char_data
         p.ParseFile(f)
         f.close()
+
+        # record each entry's enum-level flags now, while the entry is
+        # still with the declaration it came from: merge_enums() moves
+        # the entries of an extended enum into a single declaration
+        for current_enum in self.enum:
+            for enum_entry in current_enum.entry:
+                enum_entry.enum_wip = current_enum.wip
+                enum_entry.enum_deprecated = current_enum.deprecated
+                enum_entry.enum_superseded = current_enum.superseded
    
 
-        #Post process to add reserved params (for docs)
+        #Post process to add reserved params (for docs). A param is reserved if it is
+        #undeclared, tagged reserved, blank, or its text starts with "Reserved", "Empty" etc.
         for current_enum in self.enum:
             if not 'MAV_CMD' in current_enum.name:
                 continue
-            print(current_enum.name)
             for enum_entry in current_enum.entry:
-                print(enum_entry.name)
-                if len(enum_entry.param) == 7:
-                    continue
                 params_dict=dict()
                 for param_index in range (1,8):
-                    params_dict[param_index] = MAVEnumParam(param_index, label='', units='', enum='', increment='', 
-                                                        minValue='', maxValue='', default='0', reserved='True')
+                    params_dict[param_index] = MAVEnumParam(param_index, label='', units='', enum='', increment='',
+                                                        minValue='', maxValue='', reserved=True)
 
                 for a_param in enum_entry.param:
                     params_dict[int(a_param.index)] = a_param
+                for a_param in params_dict.values():
+                    if a_param.reserved or not a_param.description.strip() or RESERVED_PARAM_TEXT.match(a_param.description):
+                        a_param.set_reserved()
                 enum_entry.param=params_dict.values()
                 
 
@@ -357,8 +467,6 @@ class MAVXML(object):
             for m in self.message:
                 if m.id <= 255:
                     m2.append(m)
-                else:
-                    print("Ignoring MAVLink2 message %s" % m.name)
             self.message = m2
 
         for m in self.message:
@@ -375,16 +483,16 @@ class MAVXML(object):
             m.message_flags = 0
             m.target_system_ofs = 0
             m.target_component_ofs = 0
+            m.target_system_fieldname = None
+            m.target_component_fieldname = None
+            m.field_offsets = {}
             
-            if self.sort_fields:
-                # when we have extensions we only sort up to the first extended field
-                sort_end = m.base_fields()
-                m.ordered_fields = sorted(m.fields[:sort_end],
-                                                   key=operator.attrgetter('type_length'),
-                                                   reverse=True)
-                m.ordered_fields.extend(m.fields[sort_end:])
-            else:
-                m.ordered_fields = m.fields
+            # when we have extensions we only sort up to the first extended field
+            sort_end = m.base_fields()
+            m.ordered_fields = sorted(m.fields[:sort_end],
+                                      key=operator.attrgetter('type_length'),
+                                      reverse=True)
+            m.ordered_fields.extend(m.fields[sort_end:])
             for f in m.fields:
                 m.fieldnames.append(f.name)
                 L = f.array_length
@@ -398,7 +506,14 @@ class MAVXML(object):
             for i in range(len(m.ordered_fields)):
                 f = m.ordered_fields[i]
                 f.wire_offset = m.wire_length
+                m.field_offsets[f.name] = f.wire_offset
                 m.wire_length += f.wire_length
+                field_el_length = f.wire_length
+                if f.array_length > 1:
+                    field_el_length = f.wire_length / f.array_length
+                if f.wire_offset % field_el_length != 0:
+                    # misaligned field, structure will need packing in C
+                    m.needs_pack = True
                 if m.extensions_start is None or i < m.extensions_start:
                     m.wire_min_length = m.wire_length
                 m.ordered_fieldnames.append(f.name)
@@ -407,15 +522,21 @@ class MAVXML(object):
                 if f.name.find('[') != -1:
                     raise MAVParseError("invalid field name with array descriptor %s" % f.name)
                 # having flags for target_system and target_component helps a lot for routing code
+                f.is_target_system = False
+                f.is_target_component = False
                 if is_target_system_field(m, f):
                     m.message_flags |= FLAG_HAVE_TARGET_SYSTEM
                     m.target_system_ofs = f.wire_offset
+                    m.target_system_fieldname = f.name
+                    f.is_target_system = True
                 elif f.name == 'target_component':
                     m.message_flags |= FLAG_HAVE_TARGET_COMPONENT
                     m.target_component_ofs = f.wire_offset
+                    m.target_component_fieldname = f.name
+                    f.is_target_component = True
             m.num_fields = len(m.fieldnames)
             if m.num_fields > 64:
-                raise MAVParseError("num_fields=%u : Maximum number of field names allowed is" % (
+                raise MAVParseError("num_fields=%u : Maximum number of field names allowed is %u" % (
                     m.num_fields, 64))
             m.crc_extra = message_checksum(m)
 
@@ -431,16 +552,13 @@ class MAVXML(object):
             if m.wire_length > self.largest_payload:
                 self.largest_payload = m.wire_length
 
-            if m.wire_length+8 > 64:
-                print("Note: message %s is longer than 64 bytes long (%u bytes), which can cause fragmentation since many radio modems use 64 bytes as maximum air transfer unit." % (m.name, m.wire_length+8))
-
     def __str__(self):
         return "MAVXML for %s from %s (%u message, %u enums)" % (
             self.basename, self.filename, len(self.message), len(self.enum))
 
 
 def message_checksum(msg):
-    '''calculate a 8-bit checksum of the key fields of a message, so we
+    '''calculate CRC-16/MCRF4XX checksum of the key fields of a message, so we
        can detect incompatible XML changes'''
     from .mavcrc import x25crc
     crc = x25crc()
@@ -475,6 +593,13 @@ def merge_enums(xml):
                 emapitem.entry.extend(enum.entry)
                 if not emapitem.description:
                     emapitem.description = enum.description
+                # the merged enum is flagged if any declaration of it is;
+                # the entries keep the flags of their own declaration
+                emapitem.wip = emapitem.wip or enum.wip
+                if emapitem.deprecated is None:
+                    emapitem.deprecated = enum.deprecated
+                if emapitem.superseded is None:
+                    emapitem.superseded = enum.superseded
                 print("Merged enum %s" % enum.name)
             else:
                 newenums.append(enum)
@@ -539,6 +664,21 @@ def check_duplicates(xml):
                     return True
                 enummap[s1] = enummap[s2] = "%s.%s = %s @ %s:%u" % (enum.name, entry.name, entry.value, entry.origin_file, entry.origin_line)
 
+    return False
+
+def check_missing_enum(xml):
+    '''check for enum fields pointing to invalid enums'''
+
+    all_enums = set()
+    for x in xml:
+        for enum in x.enum:
+            all_enums.add(enum.name)
+    for x in xml:
+        for m in x.message:
+            for f in m.fields:
+                if f.enum and f.enum not in all_enums:
+                    print('Enum %s in %s.%s does not exist' % (f.enum, m.name, f.name))
+                    return True
     return False
 
 

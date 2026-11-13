@@ -1,4 +1,3 @@
-from __future__ import absolute_import, print_function
 from setuptools.command.build_py import build_py
 # Work around mbcs bug in distutils.
 # http://bugs.python.org/issue10945
@@ -11,9 +10,35 @@ except LookupError:
     codecs.register(func)
 
 from setuptools import setup, Extension
-import glob, os, shutil, fnmatch, platform, sys
+from Cython.Build import cythonize
+import glob, os, shutil, fnmatch, sys, platform, warnings
 
-version = '2.3.5'
+sys.path.insert(0, os.path.dirname(__file__))
+from __init__ import __version__
+
+# Option for building the fast indexer Cython module
+build_fast_index = True
+# Disable by default on Windows and macOS
+if platform.system() in ("Windows", "Darwin"):
+    build_fast_index = False
+# Allow an environment variable to override the default
+if os.getenv("PYMAVLINK_FAST_INDEX", None) == "0":
+    build_fast_index = False
+elif os.getenv("PYMAVLINK_FAST_INDEX", None) == "1":
+    build_fast_index = True
+# Handle command line arguments
+if "--no-fast-index" in sys.argv:
+    build_fast_index = False
+    sys.argv.remove("--no-fast-index")
+if "--fast-index" in sys.argv:
+    build_fast_index = True
+    sys.argv.remove("--fast-index")
+
+# Debug build option for Cython
+debug_build = False
+if "--cython-debug" in sys.argv:
+    debug_build = True
+    sys.argv.remove("--cython-debug")
 
 
 def generate_content():
@@ -23,6 +48,7 @@ def generate_content():
     # path to message_definitions directory
     if os.getenv("MDEF",None) is not None:
         mdef_paths = [os.getenv("MDEF")]
+
     else:
         mdef_paths = [os.path.join('..', 'message_definitions'),
                       os.path.join('mavlink', 'message_definitions'),
@@ -74,19 +100,6 @@ def generate_content():
                 print("Building failed %s for protocol 2.0" % xml)
                 sys.exit(1)
 
-extensions = []  # Assume we might be unable to build native code
-if platform.system() != 'Windows':
-    extensions = [ Extension('mavnative',
-                   sources=['mavnative/mavnative.c'],
-                   include_dirs=[
-                       'generator/C/include_v1.0',
-                       'generator/C/include_v2.0',
-                       'mavnative'
-                       ]
-                   ) ]
-else:
-    print("Skipping mavnative due to Windows possibly missing a compiler...")
-
 
 class custom_build_py(build_py):
     def run(self):
@@ -95,30 +108,83 @@ class custom_build_py(build_py):
         # distutils uses old-style classes, so no super()
         build_py.run(self)
 
+with open("README.md", "r", encoding = "utf-8") as fh:
+    long_description = fh.read()
+
+ext_modules = []
+
+def test_python_h_available():
+    import tempfile
+    import distutils.ccompiler
+    import distutils.sysconfig
+    import sysconfig
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "test_python_h.c")
+        with open(test_file, "w") as f:
+            f.write("#include <Python.h>\nint main() { return 0; }")
+
+        try:
+            compiler = distutils.ccompiler.new_compiler()
+            distutils.sysconfig.customize_compiler(compiler)
+
+            # Add Python include dir (e.g. /usr/include/python3.11 or C:\... on Windows)
+            python_inc = sysconfig.get_path("include")
+            compiler.add_include_dir(python_inc)
+
+            # Compile only (no linking)
+            compiler.compile([test_file], output_dir=tmpdir)
+            return True
+        except Exception as e:
+            warnings.warn(f"Disabling fast index: missing Python.h ({e})")
+            return False
+
+if build_fast_index and not test_python_h_available():
+    build_fast_index = False
+
+if build_fast_index:
+    extra_compile_args = ["-g", "-Og"] if debug_build else ["-O2"]
+    extra_link_args = ["-g"] if debug_build else []
+    ext_modules += cythonize([
+        Extension(
+            name="pymavlink.dfindexer.dfindexer_cy",
+            sources=[
+                "dfindexer/dfindexer_cy.pyx",
+                "dfindexer/dfindexer.c"
+            ],
+            include_dirs=["pymavlink/dfindexer"],
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
+        )
+    ], language_level=3)
 
 setup (name = 'pymavlink',
-       version = version,
+       version = __version__,
        description = 'Python MAVLink code',
-       long_description = ('A Python library for handling MAVLink protocol streams and log files. This allows for the '
-                           'creation of simple scripts to analyse telemetry logs from autopilots such as ArduPilot which use '
-                           'the MAVLink protocol. See the scripts that come with the package for examples of small, useful '
-                           'scripts that use pymavlink. For more information about the MAVLink protocol see '
-                           'https://mavlink.io/en/'),
+       long_description = long_description,
+       long_description_content_type = "text/markdown",
        url = 'https://github.com/ArduPilot/pymavlink/',
-       classifiers=['Development Status :: 4 - Beta',
+       classifiers=['Development Status :: 5 - Production/Stable',
                     'Environment :: Console',
                     'Intended Audience :: Science/Research',
                     'License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)',
                     'Operating System :: OS Independent',
-                    'Programming Language :: Python :: 2.7',
-                    'Programming Language :: Python :: 3.5',
-                    'Topic :: Scientific/Engineering'
+                    'Programming Language :: Python :: 3.10',
+                    'Programming Language :: Python :: 3.11',
+                    'Programming Language :: Python :: 3.12',
+                    'Programming Language :: Python :: 3.13',
+                    'Programming Language :: Python :: 3.14',
+                    'Topic :: Scientific/Engineering',
                     ],
        license='LGPLv3',
        package_dir = { 'pymavlink' : '.' },
        package_data = { 'pymavlink.dialects.v10' : ['*.xml'],
                         'pymavlink.dialects.v20' : ['*.xml'],
                         'pymavlink.generator'    : [ '*.xsd',
+                                                     'Ada/*.*',
+                                                     'Ada/examples/*.*',
+                                                     'Ada/v2/*.*',
+                                                     'Ada/v2/test/*.*',
                                                      'java/lib/*.*',
                                                      'java/lib/Messages/*.*',
                                                      'C/include_v1.0/*.h',
@@ -126,16 +192,20 @@ setup (name = 'pymavlink',
                                                      'C/include_v2.0/*.h',
                                                      'C/include_v2.0/*.hpp',
                                                      'CPP11/include_v2.0/*.hpp',
-                                                     'CS/common/*.cs',
-                                                     'swift/*.swift',],
-                        'pymavlink'              : ['mavnative/*.h',
-                                                    'message_definitions/v*/*.xml']
+                                                     'CS/*.*',
+                                                     'swift/*.swift',
+                                                     'TypeScript/*.ts',
+                                                     'Rust/*.rs',],
+                        'pymavlink'              : ['message_definitions/v*/*.xml']
                         },
        packages = ['pymavlink',
                    'pymavlink.generator',
                    'pymavlink.dialects',
                    'pymavlink.dialects.v10',
-                   'pymavlink.dialects.v20'],
+                   'pymavlink.dialects.v20',
+                   'pymavlink.dfindexer',
+                   'pymavlink.tools',
+                   ],
        scripts = [ 'tools/magfit_delta.py', 'tools/mavextract.py',
                    'tools/mavgraph.py', 'tools/mavparmdiff.py',
                    'tools/mavtogpx.py', 'tools/magfit_gps.py',
@@ -153,14 +223,16 @@ setup (name = 'pymavlink',
                    'tools/mavfft.py',
                    'tools/mavfft_isb.py',
                    'tools/mavsummarize.py',
-                   'tools/MPU6KSearch.py'],
+                   'tools/mavlink_bitmask_decoder.py',
+                   'tools/magfit_WMM.py',
+                   'tools/mavbitmask_change.py',
+                   'tools/mavsensor_status_change.py',
+       ],
+       python_requires='>=3.10',
        install_requires=[
-            'future',
             'lxml',
+            'fastcrc',
        ],
-       setup_requires=[
-           'future'  # future is required by mavgen, included by this file
-       ],
+       ext_modules=ext_modules,
        cmdclass={'build_py': custom_build_py},
-       ext_modules = extensions
        )

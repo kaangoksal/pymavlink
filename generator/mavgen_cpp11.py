@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 parse a MAVLink protocol XML file and generate a C++ implementation
 
@@ -8,10 +8,9 @@ Copyright Andrew Tridgell 2011
 Copyright Vladimir Ermakov 2016
 Released under GNU GPL version 3 or later
 '''
-from __future__ import print_function
-
 import sys, textwrap, os, time
 from . import mavparse, mavtemplate
+from .mavgen_c import flag_attributes, entry_flag_attribute
 import collections
 import struct
 
@@ -36,11 +35,15 @@ TYPE_MAX = {
     'uint64_t' : tmax(64),
 }
 
-# macroses stopwords. Used to replace bad enum entry name.
-MACROSES = {
+# macros stopwords. Used to replace bad enum entry name.
+MACROS = {
     'MIN': 'MIN_',
     'MAX': 'MAX_',
     'NO_DATA': 'NO_DATA_',  # fix uAvionix enum bug
+    'NULL': 'NULL_',
+    'TRUE': 'TRUE_',
+    'FALSE': 'FALSE_',
+    'EOF': 'EOF_',
 }
 
 EType = collections.namedtuple('EType', ('type', 'max'))
@@ -48,11 +51,11 @@ EType = collections.namedtuple('EType', ('type', 'max'))
 
 def generate_main_hpp(directory, xml):
     '''generate main header per XML file'''
-    f = open(os.path.join(directory, xml.basename + ".hpp"), mode='w')
+    f = open(os.path.join(directory, xml.basename + ".hpp"), mode='w', encoding='utf-8')
     t.write(f, '''
 /** @file
- *	@brief MAVLink comm protocol generated from ${basename}.xml
- *	@see http://mavlink.org
+ *  @brief MAVLink comm protocol generated from ${basename}.xml
+ *  @see http://mavlink.org
  */
 
 #pragma once
@@ -71,7 +74,7 @@ namespace mavlink {
 namespace ${basename} {
 
 /**
- * Array of msg_entry needed for @p mavlink_parse_char() (trought @p mavlink_get_msg_entry())
+ * Array of msg_entry needed for @p mavlink_parse_char() (through @p mavlink_get_msg_entry())
  */
 constexpr std::array<mavlink_msg_entry_t, ${message_entry_len}> MESSAGE_ENTRIES {{ ${message_entry_array} }};
 
@@ -83,9 +86,9 @@ constexpr auto MAVLINK_VERSION = ${version};
 
 ${{enum:
 /** @brief ${description} */
-enum class ${name}${cxx_underlying_type}
+enum class${ENUM_ATTRIBUTE} ${name}${cxx_underlying_type}
 {
-${{entry_flt:    ${name_trim}=${value}, /* ${description} |${{param:${description}| }} */
+${{entry_flt:    ${name_trim}${ENTRY_ATTRIBUTE}=${value}, /* ${description} |${{param:${description}| }} */
 }}
 };
 
@@ -111,7 +114,72 @@ ${{include_list:#include "../${base}/${base}.hpp"
 
 def generate_message_hpp(directory, m):
     '''generate per-message header for a XML file'''
-    f = open(os.path.join(directory, 'mavlink_msg_%s.hpp' % m.name_lower), mode='w')
+    if m.wip:
+        m.MSG_ATTRIBUTE = 'MAVLINK_MSG_TYPE_WIP '
+    elif m.deprecated:
+        m.MSG_ATTRIBUTE = 'MAVLINK_MSG_TYPE_DEPRECATED '
+    elif m.superseded:
+        m.MSG_ATTRIBUTE = 'MAVLINK_MSG_TYPE_SUPERSEDED '
+    else:
+        m.MSG_ATTRIBUTE = ''
+    # generate_gtestsuite_hpp() below instantiates every message type,
+    # including flagged ones, to round-trip test it; that self-reference
+    # must not itself be diagnosed, so it's wrapped in these two - see
+    # message.hpp. Gated on a non-empty MSG_ATTRIBUTE so gtestsuite.hpp
+    # stays unchanged for the common case of no flagged messages.
+    if m.MSG_ATTRIBUTE:
+        m.CALL_GUARD_BEGIN = '    MAVLINK_DEPRECATED_CALL_BEGIN\n'
+    else:
+        m.CALL_GUARD_BEGIN = ''
+    # gtestsuite.hpp is a single ${{message: ...}} repetition, and
+    # a raw "}}" anywhere inside it - whether from a genuine nested
+    # repetition closing or just an incidental ${VAR} followed by a
+    # literal '}' - confuses the template parser's nested-repetition
+    # bracket matching (see mavgen_c.py's generate_testsuite_h() for the
+    # same issue). Two different fixes for the two closing points below:
+    #  - the first TEST()'s close is NOT adjacent to the outer
+    #    repetition's own closing '}}' (the TEST_INTEROP block follows
+    #    it), so a spurious "}}" there would prematurely end the whole
+    #    ${{message: ...}} scan. Fix: embed the closing brace
+    #    *and* the blank line that already followed it in the value, so
+    #    the raw template has no brace immediately after ${CALL_GUARD_END}
+    #    at all (next char is '#', not '}').
+    #  - the last TEST_INTEROP one's close *is* immediately before that
+    #    same outer '}}', which has to stay as literal template text for
+    #    the parser to find it - so only the function-closing brace and
+    #    '#endif' are embedded here, leaving the raw template text as
+    #    "${VAR}}}" (three '}' with no separator), which is exactly the
+    #    pattern the parser's ignore_end_token logic does handle
+    #    correctly (same as mavgen_c.py's testsuite.h fix).
+    if m.MSG_ATTRIBUTE:
+        m.CALL_GUARD_END = '    MAVLINK_DEPRECATED_CALL_END\n}\n\n'
+        m.TEST_INTEROP_CALL_GUARD_END = '    MAVLINK_DEPRECATED_CALL_END\n}\n#endif\n'
+    else:
+        m.CALL_GUARD_END = '}\n\n'
+        m.TEST_INTEROP_CALL_GUARD_END = '}\n#endif\n'
+    # WIP is different from deprecated/superseded: MAVLINK_MSG_TYPE_WIP is
+    # documented to use unavailable(), which neither GCC nor clang can
+    # silence with a diagnostic pragma (confirmed: GCC rejects
+    # -Wunavailable-declarations as an unknown pragma option, clang still
+    # diagnoses it even inside push/ignore/pop) - so CALL_GUARD_BEGIN/END
+    # above cannot make a WIP struct instantiation safe the way they do
+    # for deprecated/superseded. But MAVLINK_MSG_TYPE_WIP defaults to a
+    # no-op (see message.hpp) - nobody who hasn't opted in is affected -
+    # so unlike deprecated/superseded this must not unconditionally drop
+    # the test at generation time either, or every consumer who never
+    # touches this feature silently loses WIP test coverage (this was
+    # tried and reverted: it removed a test that a mutation check proved
+    # was catching real (de)serialization bugs). Instead wrap the whole
+    # per-message block in a *consumer*-controlled, off-by-default
+    # preprocessor guard, documented in message.hpp: only someone who
+    # both opts into the unavailable()/error() form of WIP *and* builds
+    # this generated testsuite needs to also opt out of the WIP tests.
+    if m.wip:
+        m.WIP_TEST_GUARD_BEGIN = '#ifndef MAVLINK_TESTSUITE_SKIP_WIP\n'
+        m.TEST_INTEROP_CALL_GUARD_END += '#endif // MAVLINK_TESTSUITE_SKIP_WIP\n'
+    else:
+        m.WIP_TEST_GUARD_BEGIN = ''
+    f = open(os.path.join(directory, 'mavlink_msg_%s.hpp' % m.name_lower), mode='w', encoding='utf-8')
     t.write(f, '''
 // MESSAGE ${name} support class
 
@@ -126,11 +194,11 @@ namespace msg {
  *
  * ${description}
  */
-struct ${name} : mavlink::Message {
-    static constexpr msgid_t MSG_ID = ${id};
-    static constexpr size_t LENGTH = ${wire_length};
-    static constexpr size_t MIN_LENGTH = ${wire_min_length};
-    static constexpr uint8_t CRC_EXTRA = ${crc_extra};
+struct ${MSG_ATTRIBUTE}${name} : mavlink::Message {
+    static constexpr msgid_t MSG_ID{${id}};
+    static constexpr uint8_t LENGTH{${wire_length}};
+    static constexpr uint8_t MIN_LENGTH{${wire_min_length}};
+    static constexpr uint8_t CRC_EXTRA{${crc_extra}};
     static constexpr auto NAME = "${name}";
 
 
@@ -159,17 +227,18 @@ ${{fields:        ${to_yaml_code}
         return ss.str();
     }
 
+${target_system_method}
     inline void serialize(mavlink::MsgMap &map) const override
     {
         map.reset(MSG_ID, LENGTH);
 
-${{ordered_fields:        map << ${ser_name};${ser_whitespace}// offset: ${wire_offset}
+${{ordered_fields:        ${serialize_code};${ser_whitespace}// offset: ${wire_offset}
 }}
     }
 
     inline void deserialize(mavlink::MsgMap &map) override
     {
-${{ordered_fields:        map >> ${name};${ser_whitespace}// offset: ${wire_offset}
+${{ordered_fields:        ${deserialize_code};${ser_whitespace}// offset: ${wire_offset}
 }}
     }
 };
@@ -183,11 +252,11 @@ ${{ordered_fields:        map >> ${name};${ser_whitespace}// offset: ${wire_offs
 
 def generate_gtestsuite_hpp(directory, xml):
     '''generate gtestsuite.hpp per XML file'''
-    f = open(os.path.join(directory, "gtestsuite.hpp"), mode='w')
+    f = open(os.path.join(directory, "gtestsuite.hpp"), mode='w', encoding='utf-8')
     t.write(f, '''
 /** @file
- *	@brief MAVLink comm testsuite protocol generated from ${basename}.xml
- *	@see http://mavlink.org
+ *  @brief MAVLink comm testsuite protocol generated from ${basename}.xml
+ *  @see http://mavlink.org
  */
 
 #pragma once
@@ -202,9 +271,9 @@ using namespace mavlink;
 #endif
 
 ${{message:
-TEST(${dialect_name}, ${name})
+${WIP_TEST_GUARD_BEGIN}TEST(${dialect_name}, ${name})
 {
-    mavlink::mavlink_message_t msg;
+${CALL_GUARD_BEGIN}    mavlink::mavlink_message_t msg;
     mavlink::MsgMap map1(msg);
     mavlink::MsgMap map2(msg);
 
@@ -227,12 +296,10 @@ ${{fields:    packet_in.${name} = ${cxx_test_value};
 
 ${{fields:    EXPECT_EQ(packet1.${name}, packet2.${name});
 }}
-}
-
-#ifdef TEST_INTEROP
+${CALL_GUARD_END}#ifdef TEST_INTEROP
 TEST(${dialect_name}_interop, ${name})
 {
-    mavlink_message_t msg;
+${CALL_GUARD_BEGIN}    mavlink_message_t msg;
 
     // to get nice print
     memset(&msg, 0, sizeof(msg));
@@ -262,9 +329,7 @@ ${{fields:    EXPECT_EQ(packet_in.${name}, packet2.${name});
 #ifdef PRINT_MSG
     PRINT_MSG(msg);
 #endif
-}
-#endif
-}}
+${TEST_INTEROP_CALL_GUARD_END}}}
 ''', xml)
 
     f.close()
@@ -308,12 +373,24 @@ def enum_remove_prefix(prefix, s):
         sl.insert(0, pl[-1])
 
     ret = '_'.join(sl)
-    return MACROSES.get(ret, ret)
+    return MACROS.get(ret, ret)
 
 
 def fix_int8_t(v):
     '''convert unsigned char value to signed char'''
     return struct.unpack('b', struct.pack('B', v))[0]
+
+
+def enum_flag_attribute(enum):
+    '''attribute macros for an enum class: only the flags every entry's
+    declaration has.  An entry can only be named through its enum class
+    (E::ENTRY), so a flag on the enum class is reported for every entry,
+    including those of an unflagged declaration of an enum extended in
+    another XML file'''
+    entries = [entry for entry in enum.entry if not entry.end_marker]
+    return flag_attributes(enum.wip and all(e.enum_wip for e in entries),
+                           enum.deprecated and all(e.enum_deprecated for e in entries),
+                           enum.superseded and all(e.enum_superseded for e in entries))
 
 
 def generate_one(basename, xml):
@@ -330,17 +407,18 @@ def generate_one(basename, xml):
     # work out the included headers
     xml.include_list = []
     for i in xml.include:
-        base = i[:-4]
+        base = os.path.basename(i)[:-4]
         xml.include_list.append(mav_include(base))
 
     # and message metadata array
     # we sort with primary key msgid
     xml.message_entry_len = len(xml.message_crcs)
     xml.message_entry_array = ', '.join([
-        '{%u, %u, %u, %u, %u, %u}' % (
+        '{%u, %u, %u, %u, %u, %u, %u}' % (
             msgid,
             xml.message_crcs[msgid],
             xml.message_min_lengths[msgid],
+            xml.message_lengths[msgid],
             xml.message_flags[msgid],
             xml.message_target_system_ofs[msgid],
             xml.message_target_component_ofs[msgid])
@@ -353,6 +431,10 @@ def generate_one(basename, xml):
     for m in xml.message:
         m.dialect_name = xml.basename
         m.msg_name = m.name
+        target = next((f for f in m.fields if f.is_target_system), None)
+        m.target_system_method = (
+            '    uint32_t get_target_system() const override { return %s; }\n' % target.name
+            if target else '')
 
         for f in m.fields:
             spaces = 30 - len(f.name)
@@ -409,9 +491,17 @@ def generate_one(basename, xml):
                 f.c_test_value = f.cxx_test_value
 
 
+            f.deserialize_code = 'map >> %s' % f.name
+            if f.is_target_system:
+                f.cxx_type = 'uint32_t'
+                f.serialize_code = 'map.write_target(%s)' % f.name
+                f.deserialize_code = 'map.read_target(%s)' % f.name
+
             # cope with uint8_t_mavlink_version
             if f.omit_arg:
                 f.ser_name = "%s(%s)" % (f.type, f.const_value)
+            if not f.is_target_system:
+                f.serialize_code = 'map << %s' % f.ser_name
 
     # add trimmed filed name to enums
     for e in xml.enum:
@@ -422,10 +512,15 @@ def generate_one(basename, xml):
             underlying_type = types[-1]
 
         # template do not support "if"
-        # filter out ENUM_END, it often > than unterlying type may handle
+        # filter out ENUM_END, it often > than underlying type may handle
+        # an entry also carries the wip/deprecated/superseded flags of
+        # the enum declaration it came from; the flags every declaration
+        # has also go on the enum class itself
+        e.ENUM_ATTRIBUTE = enum_flag_attribute(e)
         e.entry_flt = []
         for f in e.entry:
             f.name_trim = enum_remove_prefix(e.name, f.name)
+            f.ENTRY_ATTRIBUTE = entry_flag_attribute(f)
             if not f.end_marker:
                 e.entry_flt.append(f)
                 # XXX check all values in acceptable range

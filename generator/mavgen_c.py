@@ -1,16 +1,12 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 parse a MAVLink protocol XML file and generate a C implementation
 
 Copyright Andrew Tridgell 2011
 Released under GNU GPL version 3 or later
 '''
-from __future__ import print_function
-from future.utils import iteritems
 
-from builtins import range
-from builtins import object
-
+import hashlib
 import os
 from . import mavparse, mavtemplate
 
@@ -18,7 +14,7 @@ t = mavtemplate.MAVTemplate()
 
 def generate_version_h(directory, xml):
     '''generate version.h'''
-    f = open(os.path.join(directory, "version.h"), mode='w')
+    f = open(os.path.join(directory, "version.h"), mode='w', encoding='utf-8')
     t.write(f,'''
 /** @file
  *  @brief MAVLink comm protocol built from ${basename}.xml
@@ -39,7 +35,7 @@ def generate_version_h(directory, xml):
 
 def generate_mavlink_h(directory, xml):
     '''generate mavlink.h'''
-    f = open(os.path.join(directory, "mavlink.h"), mode='w')
+    f = open(os.path.join(directory, "mavlink.h"), mode='w', encoding='utf-8')
     t.write(f,'''
 /** @file
  *  @brief MAVLink comm protocol built from ${basename}.xml
@@ -49,7 +45,7 @@ def generate_mavlink_h(directory, xml):
 #ifndef MAVLINK_H
 #define MAVLINK_H
 
-#define MAVLINK_PRIMARY_XML_IDX ${xml_idx}
+#define MAVLINK_PRIMARY_XML_HASH ${xml_hash}
 
 #ifndef MAVLINK_STX
 #define MAVLINK_STX ${protocol_marker}
@@ -80,7 +76,7 @@ def generate_mavlink_h(directory, xml):
 
 def generate_main_h(directory, xml):
     '''generate main header per XML file'''
-    f = open(os.path.join(directory, xml.basename + ".h"), mode='w')
+    f = open(os.path.join(directory, xml.basename + ".h"), mode='w', encoding='utf-8')
     t.write(f, '''
 /** @file
  *  @brief MAVLink comm protocol generated from ${basename}.xml
@@ -94,8 +90,7 @@ def generate_main_h(directory, xml):
     #error Wrong include order: MAVLINK_${basename_upper}.H MUST NOT BE DIRECTLY USED. Include mavlink.h from the same directory instead or set ALL AND EVERY defines from MAVLINK.H manually accordingly, including the #define MAVLINK_H call.
 #endif
 
-#undef MAVLINK_THIS_XML_IDX
-#define MAVLINK_THIS_XML_IDX ${xml_idx}
+#define MAVLINK_${basename_upper}_XML_HASH ${xml_hash}
 
 #ifdef __cplusplus
 extern "C" {
@@ -123,9 +118,9 @@ ${{enum:
 #define HAVE_ENUM_${name}
 typedef enum ${name}
 {
-${{entry:   ${name}=${value}, /* ${description} |${{param:${description}| }} */
+${{entry:   ${name}${ENTRY_ATTRIBUTE}=${value}, /* ${description} |${{param:${description}| }} */
 }}
-} ${name};
+} ${name}${ENUM_ATTRIBUTE};
 #endif
 }}
 
@@ -148,10 +143,8 @@ ${{message:#include "./mavlink_msg_${name_lower}.h"
 ${{include_list:#include "../${base}/${base}.h"
 }}
 
-#undef MAVLINK_THIS_XML_IDX
-#define MAVLINK_THIS_XML_IDX ${xml_idx}
 
-#if MAVLINK_THIS_XML_IDX == MAVLINK_PRIMARY_XML_IDX
+#if MAVLINK_${basename_upper}_XML_HASH == MAVLINK_PRIMARY_XML_HASH
 # define MAVLINK_MESSAGE_INFO {${message_info_array}}
 # define MAVLINK_MESSAGE_NAMES {${message_name_array}}
 # if MAVLINK_COMMAND_24BIT
@@ -170,18 +163,54 @@ ${{include_list:#include "../${base}/${base}.h"
 
 def generate_message_h(directory, m):
     '''generate per-message header for a XML file'''
-    f = open(os.path.join(directory, 'mavlink_msg_%s.h' % m.name_lower), mode='w')
+    if m.wip:
+        m.MSG_ATTRIBUTE = 'MAVLINK_WIP\n'
+    elif m.deprecated:
+        m.MSG_ATTRIBUTE = 'MAVLINK_DEPRECATED\n'
+    elif m.superseded:
+        m.MSG_ATTRIBUTE = 'MAVLINK_SUPERSEDED\n'
+    else:
+        m.MSG_ATTRIBUTE = ''
+    # only emit the MAVLINK_DEPRECATED_CALL_BEGIN/END pragma pair around the
+    # self-referential calls below for flagged messages, so headers for
+    # unflagged messages are unchanged. A flagged message's header gets the
+    # pair (diagnostic push/ignore/pop pragmas on GCC and clang) whether or
+    # not any diagnostic macro is defined; they are harmless when none is.
+    if m.MSG_ATTRIBUTE:
+        m.CALL_GUARD_BEGIN = '    MAVLINK_DEPRECATED_CALL_BEGIN\n'
+        m.CALL_GUARD_END = '    MAVLINK_DEPRECATED_CALL_END\n'
+    else:
+        m.CALL_GUARD_BEGIN = ''
+        m.CALL_GUARD_END = ''
+    # generate_testsuite_h() below is a single ${{message: ...}} repetition,
+    # so its per-message block's closing brace has to sit inside this value
+    # rather than as separate template text immediately after ${...}: the
+    # template parser mishandles a literal '}' immediately following a
+    # ${VAR} token when it's also immediately followed by the repetition's
+    # own '}}' (three '}' in a row with no separator confuses its nested-
+    # repetition bracket matching) - see generate_message_h()'s CALL_GUARD_*
+    # above, which doesn't have this problem since it isn't inside a
+    # repetition. Embedding the brace in the substituted value instead
+    # keeps the raw template text as "${VAR}}}", which is exactly the
+    # pattern the parser's ignore_end_token logic does handle correctly.
+    if m.MSG_ATTRIBUTE:
+        m.TESTSUITE_CALL_GUARD_END = '    MAVLINK_DEPRECATED_CALL_END\n}\n'
+    else:
+        m.TESTSUITE_CALL_GUARD_END = '}\n'
+    f = open(os.path.join(directory, 'mavlink_msg_%s.h' % m.name_lower), mode='w', encoding='utf-8')
     t.write(f, '''
 #pragma once
 // MESSAGE ${name} PACKING
 
+#include <stdint.h>
+
 #define MAVLINK_MSG_ID_${name} ${id}
 
-MAVPACKED(
+${MAVPACKED_START}
 typedef struct __mavlink_${name_lower}_t {
 ${{ordered_fields: ${type} ${name}${array_suffix}; /*< ${units} ${description}*/
 }}
-}) mavlink_${name_lower}_t;
+}${MAVPACKED_END} mavlink_${name_lower}_t;
 
 #define MAVLINK_MSG_ID_${name}_LEN ${wire_length}
 #define MAVLINK_MSG_ID_${name}_MIN_LEN ${wire_min_length}
@@ -221,8 +250,8 @@ ${{arg_fields: * @param ${name} ${units} ${description}
 }}
  * @return length of the message in bytes (excluding serial stream start sign)
  */
-static inline uint16_t mavlink_msg_${name_lower}_pack(uint8_t system_id, uint8_t component_id, mavlink_message_t* msg,
-                              ${{arg_fields: ${array_const}${type} ${array_prefix}${name},}})
+${MSG_ATTRIBUTE}static inline uint16_t mavlink_msg_${name_lower}_pack(${sysid_arg_type} system_id, uint8_t component_id, mavlink_message_t* msg,
+                              ${{arg_fields: ${array_const}${arg_type} ${array_prefix}${name},}})
 {
 #if MAVLINK_NEED_BYTE_SWAP || !MAVLINK_ALIGNED_FIELDS
     char buf[MAVLINK_MSG_ID_${name}_LEN];
@@ -241,7 +270,45 @@ ${{array_fields:    mav_array_memcpy(packet.${name}, ${name}, sizeof(${type})*${
 #endif
 
     msg->msgid = MAVLINK_MSG_ID_${name};
-    return mavlink_finalize_message(msg, system_id, component_id, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC);
+    return mavlink_finalize_message${target_suffix}(msg, system_id, component_id, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC${target_args});
+}
+
+/**
+ * @brief Pack a ${name_lower} message
+ * @param system_id ID of this system
+ * @param component_id ID of this component (e.g. 200 for IMU)
+ * @param status MAVLink status structure
+ * @param msg The MAVLink message to compress the data into
+ *
+${{arg_fields: * @param ${name} ${units} ${description}
+}}
+ * @return length of the message in bytes (excluding serial stream start sign)
+ */
+${MSG_ATTRIBUTE}static inline uint16_t mavlink_msg_${name_lower}_pack_status(${sysid_arg_type} system_id, uint8_t component_id, mavlink_status_t *_status, mavlink_message_t* msg,
+                              ${{arg_fields: ${array_const}${arg_type} ${array_prefix}${name},}})
+{
+#if MAVLINK_NEED_BYTE_SWAP || !MAVLINK_ALIGNED_FIELDS
+    char buf[MAVLINK_MSG_ID_${name}_LEN];
+${{scalar_fields:    _mav_put_${type}(buf, ${wire_offset}, ${putname});
+}}
+${{array_fields:    _mav_put_${type}_array(buf, ${wire_offset}, ${name}, ${array_length});
+}}
+        memcpy(_MAV_PAYLOAD_NON_CONST(msg), buf, MAVLINK_MSG_ID_${name}_LEN);
+#else
+    mavlink_${name_lower}_t packet;
+${{scalar_fields:    packet.${name} = ${putname};
+}}
+${{array_fields:    mav_array_memcpy(packet.${name}, ${name}, sizeof(${type})*${array_length});
+}}
+        memcpy(_MAV_PAYLOAD_NON_CONST(msg), &packet, MAVLINK_MSG_ID_${name}_LEN);
+#endif
+
+    msg->msgid = MAVLINK_MSG_ID_${name};
+#if MAVLINK_CRC_EXTRA
+    return mavlink_finalize_message_buffer${target_suffix}(msg, system_id, component_id, _status, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC${target_args});
+#else
+    return mavlink_finalize_message_buffer${target_suffix}(msg, system_id, component_id, _status, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, 0${target_args});
+#endif
 }
 
 /**
@@ -254,9 +321,9 @@ ${{arg_fields: * @param ${name} ${units} ${description}
 }}
  * @return length of the message in bytes (excluding serial stream start sign)
  */
-static inline uint16_t mavlink_msg_${name_lower}_pack_chan(uint8_t system_id, uint8_t component_id, uint8_t chan,
+${MSG_ATTRIBUTE}static inline uint16_t mavlink_msg_${name_lower}_pack_chan(${sysid_arg_type} system_id, uint8_t component_id, uint8_t chan,
                                mavlink_message_t* msg,
-                                   ${{arg_fields:${array_const}${type} ${array_prefix}${name},}})
+                                   ${{arg_fields:${array_const}${arg_type} ${array_prefix}${name},}})
 {
 #if MAVLINK_NEED_BYTE_SWAP || !MAVLINK_ALIGNED_FIELDS
     char buf[MAVLINK_MSG_ID_${name}_LEN];
@@ -275,7 +342,7 @@ ${{array_fields:    mav_array_memcpy(packet.${name}, ${name}, sizeof(${type})*${
 #endif
 
     msg->msgid = MAVLINK_MSG_ID_${name};
-    return mavlink_finalize_message_chan(msg, system_id, component_id, chan, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC);
+    return mavlink_finalize_message_chan${target_suffix}(msg, system_id, component_id, chan, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC${target_args});
 }
 
 /**
@@ -286,10 +353,10 @@ ${{array_fields:    mav_array_memcpy(packet.${name}, ${name}, sizeof(${type})*${
  * @param msg The MAVLink message to compress the data into
  * @param ${name_lower} C-struct to read the message contents from
  */
-static inline uint16_t mavlink_msg_${name_lower}_encode(uint8_t system_id, uint8_t component_id, mavlink_message_t* msg, const mavlink_${name_lower}_t* ${name_lower})
+${MSG_ATTRIBUTE}static inline uint16_t mavlink_msg_${name_lower}_encode(${sysid_arg_type} system_id, uint8_t component_id, mavlink_message_t* msg, const mavlink_${name_lower}_t* ${name_lower})
 {
-    return mavlink_msg_${name_lower}_pack(system_id, component_id, msg,${{arg_fields: ${name_lower}->${name},}});
-}
+${CALL_GUARD_BEGIN}    return mavlink_msg_${name_lower}_pack(system_id, component_id, msg,${{arg_fields: ${name_lower}->${name},}});
+${CALL_GUARD_END}}
 
 /**
  * @brief Encode a ${name_lower} struct on a channel
@@ -300,10 +367,24 @@ static inline uint16_t mavlink_msg_${name_lower}_encode(uint8_t system_id, uint8
  * @param msg The MAVLink message to compress the data into
  * @param ${name_lower} C-struct to read the message contents from
  */
-static inline uint16_t mavlink_msg_${name_lower}_encode_chan(uint8_t system_id, uint8_t component_id, uint8_t chan, mavlink_message_t* msg, const mavlink_${name_lower}_t* ${name_lower})
+${MSG_ATTRIBUTE}static inline uint16_t mavlink_msg_${name_lower}_encode_chan(${sysid_arg_type} system_id, uint8_t component_id, uint8_t chan, mavlink_message_t* msg, const mavlink_${name_lower}_t* ${name_lower})
 {
-    return mavlink_msg_${name_lower}_pack_chan(system_id, component_id, chan, msg,${{arg_fields: ${name_lower}->${name},}});
-}
+${CALL_GUARD_BEGIN}    return mavlink_msg_${name_lower}_pack_chan(system_id, component_id, chan, msg,${{arg_fields: ${name_lower}->${name},}});
+${CALL_GUARD_END}}
+
+/**
+ * @brief Encode a ${name_lower} struct with provided status structure
+ *
+ * @param system_id ID of this system
+ * @param component_id ID of this component (e.g. 200 for IMU)
+ * @param status MAVLink status structure
+ * @param msg The MAVLink message to compress the data into
+ * @param ${name_lower} C-struct to read the message contents from
+ */
+${MSG_ATTRIBUTE}static inline uint16_t mavlink_msg_${name_lower}_encode_status(${sysid_arg_type} system_id, uint8_t component_id, mavlink_status_t* _status, mavlink_message_t* msg, const mavlink_${name_lower}_t* ${name_lower})
+{
+${CALL_GUARD_BEGIN}    return mavlink_msg_${name_lower}_pack_status(system_id, component_id, _status, msg, ${{arg_fields: ${name_lower}->${name},}});
+${CALL_GUARD_END}}
 
 /**
  * @brief Send a ${name_lower} message
@@ -314,7 +395,7 @@ ${{arg_fields: * @param ${name} ${units} ${description}
  */
 #ifdef MAVLINK_USE_CONVENIENCE_FUNCTIONS
 
-static inline void mavlink_msg_${name_lower}_send(mavlink_channel_t chan,${{arg_fields: ${array_const}${type} ${array_prefix}${name},}})
+${MSG_ATTRIBUTE}static inline void mavlink_msg_${name_lower}_send(mavlink_channel_t chan,${{arg_fields: ${array_const}${arg_type} ${array_prefix}${name},}})
 {
 #if MAVLINK_NEED_BYTE_SWAP || !MAVLINK_ALIGNED_FIELDS
     char buf[MAVLINK_MSG_ID_${name}_LEN];
@@ -322,14 +403,14 @@ ${{scalar_fields:    _mav_put_${type}(buf, ${wire_offset}, ${putname});
 }}
 ${{array_fields:    _mav_put_${type}_array(buf, ${wire_offset}, ${name}, ${array_length});
 }}
-    _mav_finalize_message_chan_send(chan, MAVLINK_MSG_ID_${name}, buf, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC);
+    _mav_finalize_message_chan_send${target_suffix}(chan, MAVLINK_MSG_ID_${name}, buf, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC${target_args});
 #else
     mavlink_${name_lower}_t packet;
 ${{scalar_fields:    packet.${name} = ${putname};
 }}
 ${{array_fields:    mav_array_memcpy(packet.${name}, ${name}, sizeof(${type})*${array_length});
 }}
-    _mav_finalize_message_chan_send(chan, MAVLINK_MSG_ID_${name}, (const char *)&packet, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC);
+    _mav_finalize_message_chan_send${target_suffix}(chan, MAVLINK_MSG_ID_${name}, (const char *)&packet, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC${target_args});
 #endif
 }
 
@@ -338,24 +419,24 @@ ${{array_fields:    mav_array_memcpy(packet.${name}, ${name}, sizeof(${type})*${
  * @param chan MAVLink channel to send the message
  * @param struct The MAVLink struct to serialize
  */
-static inline void mavlink_msg_${name_lower}_send_struct(mavlink_channel_t chan, const mavlink_${name_lower}_t* ${name_lower})
+${MSG_ATTRIBUTE}static inline void mavlink_msg_${name_lower}_send_struct(mavlink_channel_t chan, const mavlink_${name_lower}_t* ${name_lower})
 {
 #if MAVLINK_NEED_BYTE_SWAP || !MAVLINK_ALIGNED_FIELDS
-    mavlink_msg_${name_lower}_send(chan,${{arg_fields: ${name_lower}->${name},}});
-#else
+${CALL_GUARD_BEGIN}    mavlink_msg_${name_lower}_send(chan,${{arg_fields: ${name_lower}->${name},}});
+${CALL_GUARD_END}#else
     _mav_finalize_message_chan_send(chan, MAVLINK_MSG_ID_${name}, (const char *)${name_lower}, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC);
 #endif
 }
 
 #if MAVLINK_MSG_ID_${name}_LEN <= MAVLINK_MAX_PAYLOAD_LEN
 /*
-  This varient of _send() can be used to save stack space by re-using
+  This variant of _send() can be used to save stack space by reusing
   memory from the receive buffer.  The caller provides a
   mavlink_message_t which is the size of a full mavlink message. This
   is usually the receive buffer for the channel, and allows a reply to an
   incoming message with minimum stack space usage.
  */
-static inline void mavlink_msg_${name_lower}_send_buf(mavlink_message_t *msgbuf, mavlink_channel_t chan, ${{arg_fields: ${array_const}${type} ${array_prefix}${name},}})
+${MSG_ATTRIBUTE}static inline void mavlink_msg_${name_lower}_send_buf(mavlink_message_t *msgbuf, mavlink_channel_t chan, ${{arg_fields: ${array_const}${arg_type} ${array_prefix}${name},}})
 {
 #if MAVLINK_NEED_BYTE_SWAP || !MAVLINK_ALIGNED_FIELDS
     char *buf = (char *)msgbuf;
@@ -363,14 +444,14 @@ ${{scalar_fields:    _mav_put_${type}(buf, ${wire_offset}, ${putname});
 }}
 ${{array_fields:    _mav_put_${type}_array(buf, ${wire_offset}, ${name}, ${array_length});
 }}
-    _mav_finalize_message_chan_send(chan, MAVLINK_MSG_ID_${name}, buf, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC);
+    _mav_finalize_message_chan_send${target_suffix}(chan, MAVLINK_MSG_ID_${name}, buf, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC${target_args});
 #else
     mavlink_${name_lower}_t *packet = (mavlink_${name_lower}_t *)msgbuf;
 ${{scalar_fields:    packet->${name} = ${putname};
 }}
 ${{array_fields:    mav_array_memcpy(packet->${name}, ${name}, sizeof(${type})*${array_length});
 }}
-    _mav_finalize_message_chan_send(chan, MAVLINK_MSG_ID_${name}, (const char *)packet, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC);
+    _mav_finalize_message_chan_send${target_suffix}(chan, MAVLINK_MSG_ID_${name}, (const char *)packet, MAVLINK_MSG_ID_${name}_MIN_LEN, MAVLINK_MSG_ID_${name}_LEN, MAVLINK_MSG_ID_${name}_CRC${target_args});
 #endif
 }
 #endif
@@ -379,15 +460,15 @@ ${{array_fields:    mav_array_memcpy(packet->${name}, ${name}, sizeof(${type})*$
 
 // MESSAGE ${name} UNPACKING
 
-${{fields:
+${{getter_fields:
 /**
  * @brief Get field ${name} from ${name_lower} message
  *
  * @return ${units} ${description}
  */
-static inline ${return_type} mavlink_msg_${name_lower}_get_${name}(const mavlink_message_t* msg${get_arg})
+${MSG_ATTRIBUTE}static inline ${return_type} mavlink_msg_${name_lower}_get_${name}(const mavlink_message_t* msg${get_arg})
 {
-    return _MAV_RETURN_${type}${array_tag}(msg, ${array_return_arg} ${wire_offset});
+    ${target_check}return _MAV_RETURN_${type}${array_tag}(msg, ${array_return_arg} ${wire_offset});
 }
 }}
 
@@ -397,15 +478,14 @@ static inline ${return_type} mavlink_msg_${name_lower}_get_${name}(const mavlink
  * @param msg The message to decode
  * @param ${name_lower} C-struct to decode the message contents into
  */
-static inline void mavlink_msg_${name_lower}_decode(const mavlink_message_t* msg, mavlink_${name_lower}_t* ${name_lower})
+${MSG_ATTRIBUTE}static inline void mavlink_msg_${name_lower}_decode(const mavlink_message_t* msg, mavlink_${name_lower}_t* ${name_lower})
 {
 #if MAVLINK_NEED_BYTE_SWAP || !MAVLINK_ALIGNED_FIELDS
-${{ordered_fields:    ${decode_left}mavlink_msg_${name_lower}_get_${name}(msg${decode_right});
+${CALL_GUARD_BEGIN}${{ordered_fields:    ${decode_left}${decode_call};
 }}
+${CALL_GUARD_END}${decode_post}
 #else
-        uint8_t len = msg->len < MAVLINK_MSG_ID_${name}_LEN? msg->len : MAVLINK_MSG_ID_${name}_LEN;
-        memset(${name_lower}, 0, MAVLINK_MSG_ID_${name}_LEN);
-    memcpy(${name_lower}, _MAV_PAYLOAD(msg), len);
+${decode_aligned}
 #endif
 }
 ''', m)
@@ -414,11 +494,11 @@ ${{ordered_fields:    ${decode_left}mavlink_msg_${name_lower}_get_${name}(msg${d
 
 def generate_testsuite_h(directory, xml):
     '''generate testsuite.h per XML file'''
-    f = open(os.path.join(directory, "testsuite.h"), mode='w')
+    f = open(os.path.join(directory, "testsuite.h"), mode='w', encoding='utf-8')
     t.write(f, '''
 /** @file
  *    @brief MAVLink comm protocol testsuite generated from ${basename}.xml
- *    @see http://qgroundcontrol.org/mavlink/
+ *    @see https://mavlink.io/en/
  */
 #pragma once
 #ifndef ${basename_upper}_TESTSUITE_H
@@ -448,7 +528,7 @@ ${{include_list:#include "../${base}/testsuite.h"
 ${{message:
 static void mavlink_test_${name_lower}(uint8_t system_id, uint8_t component_id, mavlink_message_t *last_msg)
 {
-#ifdef MAVLINK_STATUS_FLAG_OUT_MAVLINK1
+${CALL_GUARD_BEGIN}#ifdef MAVLINK_STATUS_FLAG_OUT_MAVLINK1
     mavlink_status_t *status = mavlink_get_channel_status(MAVLINK_COMM_0);
         if ((status->flags & MAVLINK_STATUS_FLAG_OUT_MAVLINK1) && MAVLINK_MSG_ID_${name} >= 256) {
             return;
@@ -499,8 +579,12 @@ static void mavlink_test_${name_lower}(uint8_t system_id, uint8_t component_id, 
     mavlink_msg_${name_lower}_send(MAVLINK_COMM_1 ${{arg_fields:, packet1.${name} }});
     mavlink_msg_${name_lower}_decode(last_msg, &packet2);
         MAVLINK_ASSERT(memcmp(&packet1, &packet2, sizeof(packet1)) == 0);
-}
-}}
+
+#ifdef MAVLINK_HAVE_GET_MESSAGE_INFO
+    MAVLINK_ASSERT(mavlink_get_message_info_by_name("${name}") != NULL);
+    MAVLINK_ASSERT(mavlink_get_message_info_by_id(MAVLINK_MSG_ID_${name}) != NULL);
+#endif
+${TESTSUITE_CALL_GUARD_END}}}
 
 static void mavlink_test_${basename}(uint8_t system_id, uint8_t component_id, mavlink_message_t *last_msg)
 {
@@ -520,7 +604,6 @@ def copy_fixed_headers(directory, xml):
     '''copy the fixed protocol headers to the target directory'''
     import shutil, filecmp
     hlist = {
-        "0.9": [ 'protocol.h', 'mavlink_helpers.h', 'mavlink_types.h', 'checksum.h' ],
         "1.0": [ 'protocol.h', 'mavlink_helpers.h', 'mavlink_types.h', 'checksum.h', 'mavlink_conversions.h' ],
         "2.0": [ 'protocol.h', 'mavlink_helpers.h', 'mavlink_types.h', 'checksum.h', 'mavlink_conversions.h',
                  'mavlink_get_info.h', 'mavlink_sha256.h' ]
@@ -539,6 +622,34 @@ class mav_include(object):
     def __init__(self, base):
         self.base = base
 
+def flag_attributes(wip, deprecated, superseded):
+    '''attribute macros for wip/deprecated/superseded flags.  Every flag
+    that is set gets its macro, so a project that defines the macros
+    differently (e.g. WIP an error, deprecated a warning) sees each one'''
+    attributes = ''
+    if wip:
+        attributes += ' MAVLINK_ENUM_WIP'
+    if deprecated:
+        attributes += ' MAVLINK_ENUM_DEPRECATED'
+    if superseded:
+        attributes += ' MAVLINK_ENUM_SUPERSEDED'
+    return attributes
+
+
+def enum_flag_attribute(enum):
+    '''attribute macros for an enum flagged wip/deprecated/superseded'''
+    return flag_attributes(enum.wip, enum.deprecated, enum.superseded)
+
+
+def entry_flag_attribute(entry):
+    '''attribute macros for an enum entry: its own flags plus those of
+    the enum declaration it came from, which for an enum extended by
+    another XML file is not necessarily the merged enum'''
+    return flag_attributes(entry.wip or entry.enum_wip,
+                           entry.deprecated or entry.enum_deprecated,
+                           entry.superseded or entry.enum_superseded)
+
+
 def generate_one(basename, xml):
     '''generate headers for one XML file'''
 
@@ -547,30 +658,20 @@ def generate_one(basename, xml):
     print("Generating C implementation in directory %s" % directory)
     mavparse.mkdir_p(directory)
 
-    if xml.little_endian:
-        xml.mavlink_endian = "MAVLINK_LITTLE_ENDIAN"
-    else:
-        xml.mavlink_endian = "MAVLINK_BIG_ENDIAN"
-
-    if xml.crc_extra:
-        xml.crc_extra_define = "1"
-    else:
-        xml.crc_extra_define = "0"
+    xml.mavlink_endian = "MAVLINK_LITTLE_ENDIAN"
+    xml.crc_extra_define = "1"
 
     if xml.command_24bit:
         xml.command_24bit_define = "1"
     else:
         xml.command_24bit_define = "0"
 
-    if xml.sort_fields:
-        xml.aligned_fields_define = "1"
-    else:
-        xml.aligned_fields_define = "0"
+    xml.aligned_fields_define = "1"
 
     # work out the included headers
     xml.include_list = []
     for i in xml.include:
-        base = i[:-4]
+        base = os.path.basename(i)[:-4]
         xml.include_list.append(mav_include(base))
 
     # form message lengths array
@@ -621,22 +722,58 @@ def generate_one(basename, xml):
     # form message name array
     xml.message_name_array = ''
     # sort by names
-    for msgid, name in sorted(iteritems(xml.message_names), key=lambda k_v: (k_v[1], k_v[0])):
+    for msgid, name in sorted(xml.message_names.items(), key=lambda k_v: (k_v[1], k_v[0])):
         xml.message_name_array += '{ "%s", %u }, ' % (name, msgid)
     xml.message_name_array = xml.message_name_array[:-2]
 
     # add some extra field attributes for convenience with arrays
+    sysid32_capable = (xml.wire_protocol_version == mavparse.PROTOCOL_2_0)
     for m in xml.message:
         m.msg_name = m.name
-        if xml.crc_extra:
-            m.crc_extra_arg = ", %s" % m.crc_extra
+        m.crc_extra_arg = ", %s" % m.crc_extra
+        # messages with a target_system field pass the (possibly 32 bit)
+        # target through to finalize so it can go in the extended header.
+        # MAVLink1 fixed headers have no extended header support
+        m.sysid_arg_type = 'uint32_t' if sysid32_capable else 'uint8_t'
+        if sysid32_capable and m.target_system_fieldname is not None:
+            m.target_suffix = '_target'
+            m.target_args = ', %s' % m.target_system_fieldname
+            # The header overrides payload targets. Keep the non-broadcast
+            # sentinel only for system IDs that do not fit in the struct.
+            m.decode_post = ('    if (msg->incompat_flags & MAVLINK_IFLAG_TARGET32) {\n'
+                             '        // This uint8_t field cannot retain a wide target. The sentinel is NOT reserved.\n'
+                             '        // For routing use mavlink_msg_get_target_sysid(msg, mavlink_get_msg_entry(msg->msgid)).\n'
+                             '        // To relay after edits, pass that full target to _pack*(); _encode*() loses it.\n'
+                             '        %s->%s = mavlink_msg_target_field(msg->target_sysid);\n'
+                             % (m.name_lower, m.target_system_fieldname))
+            m.decode_post += '    }\n'
         else:
-            m.crc_extra_arg = ""
+            m.target_suffix = ''
+            m.target_args = ''
+            m.decode_post = ''
+        if sysid32_capable and m.target_system_fieldname is not None:
+            m.decode_aligned = ('    mavlink_msg_decode_target(msg, %s, MAVLINK_MSG_ID_%s_LEN, %u);'
+                                % (m.name_lower, m.name, m.target_system_ofs))
+        else:
+            m.decode_aligned = ('    uint8_t len = msg->len < MAVLINK_MSG_ID_%s_LEN ? msg->len : MAVLINK_MSG_ID_%s_LEN;\n'
+                                '    memset(%s, 0, MAVLINK_MSG_ID_%s_LEN);\n'
+                                '    memcpy(%s, _MAV_PAYLOAD(msg), len);'
+                                % (m.name, m.name, m.name_lower, m.name, m.name_lower))
+        # Target-system access must use the generic header-aware helper.
+        m.getter_fields = [f for f in m.fields if not f.is_target_system]
         for f in m.fields:
             if f.print_format is None:
                 f.c_print_format = 'NULL'
             else:
                 f.c_print_format = '"%s"' % f.print_format
+            # target_system args widen to uint32_t; targets > 255 travel in
+            # the extended header, with a non-broadcast payload sentinel. Use the generic
+            # mavlink_msg_get_target_system() to retrieve the full target.
+            f.arg_type = f.type
+            f.target_check = ''
+            if sysid32_capable:
+                if f.is_target_system:
+                    f.arg_type = 'uint32_t'
             if f.array_length != 0:
                 f.array_suffix = '[%u]' % f.array_length
                 f.array_prefix = '*'
@@ -674,6 +811,19 @@ def generate_one(basename, xml):
                     f.c_test_value = "%sLL" % f.test_value                    
                 else:
                     f.c_test_value = f.test_value
+            # Decode the wire payload before decode_post replaces the legacy payload target
+            # for an extended target with the non-broadcast sentinel in both aligned and byte-swap
+            # builds. The full target remains available from the generic getter.
+            if f.is_target_system:
+                f.decode_call = '_MAV_RETURN_uint8_t(msg, %u)' % f.wire_offset
+            else:
+                f.decode_call = 'mavlink_msg_%s_get_%s(msg%s)' % (m.name_lower, f.name, f.decode_right)
+        if m.needs_pack:
+            m.MAVPACKED_START = "MAVPACKED("
+            m.MAVPACKED_END = ")"
+        else:
+            m.MAVPACKED_START = ""
+            m.MAVPACKED_END = ""
 
     # cope with uint8_t_mavlink_version
     for m in xml.message:
@@ -688,9 +838,24 @@ def generate_one(basename, xml):
         for f in m.fields:
             if not f.omit_arg:
                 m.arg_fields.append(f)
-                f.putname = f.name
+                if sysid32_capable and f.is_target_system:
+                    # targets > 255 go in the extended header; the payload
+                    # byte must not be interpreted as broadcast
+                    f.putname = 'mavlink_msg_target_field(%s)' % f.name
+                else:
+                    f.putname = f.name
             else:
                 f.putname = f.const_value
+
+    # add attributes for enums and enum/MAV_CMD entries flagged
+    # wip/deprecated/superseded.  An entry also carries the flags of the
+    # enum declaration it came from.  The enum's attributes go on the
+    # typedef name, not the enum tag, so the typedef itself does not
+    # trigger them.
+    for enum in xml.enum:
+        enum.ENUM_ATTRIBUTE = enum_flag_attribute(enum)
+        for entry in enum.entry:
+            entry.ENTRY_ATTRIBUTE = entry_flag_attribute(entry)
 
     generate_mavlink_h(directory, xml)
     generate_version_h(directory, xml)
@@ -700,11 +865,18 @@ def generate_one(basename, xml):
     generate_testsuite_h(directory, xml)
 
 
+def xml_name_hash(basename):
+    '''deterministic 64-bit signed hash of a dialect name; the builtin
+    hash() is randomised per interpreter run (PYTHONHASHSEED), which
+    makes regenerated headers differ even for identical XML'''
+    digest = hashlib.sha256(basename.encode('utf-8')).digest()
+    return int.from_bytes(digest[:8], 'little', signed=True)
+
 def generate(basename, xml_list):
     '''generate complete MAVLink C implemenation'''
 
     for idx in range(len(xml_list)):
         xml = xml_list[idx]
-        xml.xml_idx = idx
+        xml.xml_hash = xml_name_hash(xml.basename)
         generate_one(basename, xml)
     copy_fixed_headers(basename, xml_list[0])

@@ -1,12 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Parse a MAVLink protocol XML file and generate Swift implementation
 
 Copyright Max Odnovolyk 2015
 Released under GNU GPL version 3 or later
 """
-from __future__ import print_function
-
 import os
 from . import mavparse, mavtemplate
 
@@ -35,12 +33,14 @@ def generate_mavlink(directory, filelist, xml_list, msgs):
     mavparse.mkdir_p(directory)
     filename = 'MAVLink.swift'
     filepath = os.path.join(directory, filename)
-    outf = open(filepath, "w")
+    outf = open(filepath, "w", encoding='utf-8')
     generate_header(outf, filelist, xml_list, filename)
     append_static_code('MAVLink.swift', outf)
     generate_message_mappings_array(outf, msgs)
     generate_message_lengths_array(outf, msgs)
     generate_message_crc_extra_array(outf, msgs)
+    outf.write("\nprivate let defaultMavlink2 = %s\n" % ("true" if xml_list[0].wire_protocol_version == "2.0" else "false"))
+    outf.write("private let messageMinimumLengths: [UInt32: UInt8] = [%s]\n" % ", ".join("%u: %u" % (m.id, m.wire_min_length) for m in msgs))
     outf.close()
 
 def generate_header(outf, filelist, xml_list, filename):
@@ -59,15 +59,17 @@ def generate_header(outf, filelist, xml_list, filename):
       'FILELIST' : ", ".join(filelist),
       'PARSE_TIME' : xml_list[0].parse_time})
 
-def generate_enums(directory, filelist, xml_list, enums, msgs):
+def generate_enums(directory, filelist, xml_list, enums):
     """Iterate through all enums and create Swift equivalents"""
 
     print("Generating Enumerations")
 
     for enum in enums:
+        if enum.is_a_bitmask:
+            continue
         filename = "%s%sEnum.swift" % (enum.swift_name, enum.basename)
         filepath = os.path.join(directory, filename)
-        outf = open(filepath, "w")
+        outf = open(filepath, "w", encoding='utf-8')
         generate_header(outf, filelist, xml_list, filename)
         t.write(outf, """
 ${formatted_description}public enum ${swift_name}: ${raw_value_type} {
@@ -84,8 +86,42 @@ extension ${swift_name}: Enumeration {
 """, enum)
         outf.close()
 
+def generate_optionsets(directory, filelist, xml_list, enums):
+    """Iterate through all enums and create Swift equivalents"""
+
+    print("Generating Enumerations")
+
+    for enum in enums:
+        if not enum.is_a_bitmask:
+            continue
+        for entry in enum.entry:
+            entry.parent_swift_name = enum.swift_name
+        filename = "%s%sOptionSet.swift" % (enum.swift_name, enum.basename)
+        filepath = os.path.join(directory, filename)
+        outf = open(filepath, "w", encoding='utf-8')
+        generate_header(outf, filelist, xml_list, filename)
+        t.write(outf, """
+${formatted_description}public struct ${swift_name}: OptionSet {
+\tpublic let rawValue: ${raw_value_type}
+
+\tpublic init(rawValue: ${raw_value_type}) {
+\t\tself.rawValue = rawValue
+\t}
+${{entry:${formatted_description}\tpublic static let ${swift_name} = ${parent_swift_name}(rawValue: ${value})\n}}
+}
+
+extension ${swift_name}: MAVLinkBitmask {
+    public static var typeName = "${name}"
+    public static var typeDescription = "${entity_description}"
+    public static var allMembers = [${all_entities}]
+    public static var membersDescriptions = [${entities_info}]
+    public static var enumEnd = UInt(${enum_end})
+}
+""", enum)
+        outf.close()
+
 def get_enum_raw_type(enum, msgs):
-    """Search appropirate raw type for enums in messages fields"""
+    """Search appropriate raw type for enums in messages fields"""
 
     for msg in msgs:
         for field in msg.fields:
@@ -101,17 +137,17 @@ def generate_messages(directory, filelist, xml_list, msgs):
     for msg in msgs:
         filename = "%s%sMsg.swift" % (msg.swift_name, msg.basename)
         filepath = os.path.join(directory, filename)
-        outf = open(filepath, "w")
+        outf = open(filepath, "w", encoding='utf-8')
         generate_header(outf, filelist, xml_list, filename)
         t.write(outf, """
 import Foundation
 
 ${formatted_description}public struct ${swift_name} {
-${{fields:${formatted_description}\tpublic let ${swift_name}: ${return_type}\n}}
+${{fields:${formatted_description}\tpublic ${mutability} ${swift_name}: ${return_type}\n}}
 }
 
 extension ${swift_name}: Message {
-    public static let id = UInt8(${id})
+    public static let id = UInt32(${id})
     public static var typeName = "${name}"
     public static var typeDescription = "${message_description}"
     public static var fieldDefinitions: [FieldDefinition] = [${fields_info}]
@@ -120,6 +156,7 @@ extension ${swift_name}: Message {
 ${{ordered_fields:\t\t${init_accessor} = ${initial_value}\n}}
     }
 
+${target_accessors}
     public func pack() throws -> Data {
         var payload = Data(count: ${wire_length})
 ${{ordered_fields:\t\ttry payload.${payload_setter}\n}}
@@ -137,7 +174,7 @@ def append_static_code(filename, outf):
     
     print("Appending content of %s" % filename)
     
-    with open(filepath) as inf:
+    with open(filepath, encoding='utf-8') as inf:
         for line in inf:
             outf.write(line) 
 
@@ -150,7 +187,7 @@ def generate_message_mappings_array(outf, msgs):
     t.write(outf, """
 
 /// Array for mapping message id to proper struct
-private let messageIdToClass: [UInt8: Message.Type] = [${ARRAY_CONTENT}]
+private let messageIdToClass: [UInt32: Message.Type] = [${ARRAY_CONTENT}]
 """, {'ARRAY_CONTENT' : ", ".join(classes)})
 
 def generate_message_lengths_array(outf, msgs):
@@ -164,7 +201,7 @@ def generate_message_lengths_array(outf, msgs):
     t.write(outf, """
 
 /// Message lengths array for known messages length validation
-private let messageLengths: [UInt8: UInt8] = [${ARRAY_CONTENT}]
+private let messageLengths: [UInt32: UInt8] = [${ARRAY_CONTENT}]
 """, {'ARRAY_CONTENT' : ", ".join(lengths)})
 
 def generate_message_crc_extra_array(outf, msgs):
@@ -177,7 +214,7 @@ def generate_message_crc_extra_array(outf, msgs):
     t.write(outf, """
 
 /// Message CRSs extra for detection incompatible XML changes
-private let messageCRCsExtra: [UInt8: UInt8] = [${ARRAY_CONTENT}]
+private let messageCRCsExtra: [UInt32: UInt8] = [${ARRAY_CONTENT}]
 """, {'ARRAY_CONTENT' : ", ".join(crcs)})
 
 def camel_case_from_underscores(string):
@@ -203,6 +240,23 @@ def lower_camel_case_from_underscores(string):
         string += component[0].upper() + component[1:].lower()
 
     return string
+
+def contains_a_bitmask(enums, enumName):
+    for enum in enums:
+        if enum.name == enumName:
+            return enum.is_a_bitmask
+    return False
+
+def enum_is_a_bitmask(enum):
+    values = []
+    for entry in enum.entry:
+        values.append(entry.value)
+    values.sort()
+    for i, value in enumerate(values):
+        if 2 ** i != value:
+            return False
+    return True
+
 
 def generate_enums_type_info(enums, msgs):
     """Add camel case swift names for enums an entries, descriptions and sort enums alphabetically"""
@@ -246,11 +300,12 @@ def generate_enums_type_info(enums, msgs):
         enum.all_entities = ", ".join(all_entities)
         enum.entities_info = ", ".join(entities_info)
         enum.entity_description = enum.description.replace('"','\\"')
+        enum.is_a_bitmask = enum_is_a_bitmask(enum)
 
     enums.sort(key = lambda enum : enum.swift_name)
 
-def generate_messages_type_info(msgs):
-    """Add proper formated variable names, initializers and type names to use in templates"""
+def generate_messages_type_info(msgs, enums):
+    """Add proper formatted variable names, initializers and type names to use in templates"""
 
     for msg in msgs:
         msg.swift_name = camel_case_from_underscores(msg.name)
@@ -270,8 +325,13 @@ def generate_messages_type_info(msgs):
             # configure fields initializers
             if field.enum:
                 # handle enums
+
+
                 field.return_type = camel_case_from_underscores(field.enum)
-                field.initial_value = "try data.enumeration(at: %u)" % field.wire_offset
+                if contains_a_bitmask(enums, field.enum):
+                    field.initial_value = "try data.bitmask(at: %u)" % field.wire_offset
+                else:
+                    field.initial_value = "try data.enumeration(at: %u)" % field.wire_offset
                 field.payload_setter = "set(%s, at: %u)" % (field.pack_accessor, field.wire_offset)
             elif field.array_length > 0:
                 if field.return_type == "String":
@@ -288,18 +348,27 @@ def generate_messages_type_info(msgs):
                 field.initial_value = "try data." + swift_types[field.type][2] % field.wire_offset
                 field.payload_setter = swift_types[field.type][3] % (field.pack_accessor, field.wire_offset)
 
+            field.mutability = "var" if field.is_target_system else "let"
+            if field.is_target_system:
+                field.return_type = "UInt32"
+                field.initial_value = "UInt32(try data.number(at: %u) as UInt8)" % field.wire_offset
+                field.payload_setter = "set(UInt8(min(%s, 255)), at: %u)" % (field.pack_accessor, field.wire_offset)
             field.formatted_description = ""
             if field.description:
                 field.description = " ".join(field.description.split())
                 field.formatted_description = "\n\t/// " + field.description + "\n"
          
+        target = next((f for f in msg.fields if f.is_target_system), None)
+        msg.target_accessors = ("    public var mavlinkTargetSystem: UInt32 { return %s }\n"
+                                "    public mutating func setMavlinkTargetSystem(_ value: UInt32) { %s = value }\n"
+                                % (target.swift_name, target.swift_name)) if target else ""
         fields_info = ['("%s", %u, "%s", %u, "%s")' % (field.swift_name, field.wire_offset, field.return_type, field.array_length, field.description.replace('"','\\"')) for field in msg.fields]
         msg.fields_info = ", ".join(fields_info)
 
     msgs.sort(key = lambda msg : msg.id)
 
 def generate(basename, xml_list):
-    """Generate complete MAVLink Swift implemenation"""
+    """Generate complete MAVLink Swift implementation"""
 
     msgs = []
     enums = []
@@ -314,8 +383,9 @@ def generate(basename, xml_list):
         filelist.append(os.path.basename(xml.filename))
     
     generate_enums_type_info(enums, msgs)
-    generate_messages_type_info(msgs)
+    generate_messages_type_info(msgs, enums)
 
     generate_mavlink(basename, filelist, xml_list, msgs)
-    generate_enums(basename, filelist, xml_list, enums, msgs)
+    generate_enums(basename, filelist, xml_list, enums)
+    generate_optionsets(basename, filelist, xml_list, enums)
     generate_messages(basename, filelist, xml_list, msgs)
